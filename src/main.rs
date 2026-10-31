@@ -15,7 +15,7 @@ use ratatui::{backend::CrosstermBackend, Terminal};
 use app::App;
 
 fn main() -> io::Result<()> {
-    let mut app = App::new(std::env::current_dir()?)?;
+    let mut app = App::new(std::env::current_dir()?);
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -34,10 +34,11 @@ fn main() -> io::Result<()> {
 
 fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> io::Result<()> {
     while !app.should_quit {
+        app.poll_scan();
         terminal.draw(|f| ui::draw(f, app))?;
 
-        // 250ms 동안 입력이 없으면 다시 그린다 (나중에 스캔 진행 상황 표시용)
-        if event::poll(Duration::from_millis(250))? {
+        // 입력이 없어도 80ms마다 다시 그려 스캔 결과와 스피너를 반영한다
+        if event::poll(Duration::from_millis(80))? {
             if let Event::Key(key) = event::read()? {
                 if key.kind != KeyEventKind::Press {
                     continue;

@@ -18,13 +18,29 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     ])
     .split(f.area());
 
-    // 헤더: 현재 경로와 총 용량
-    let header = Paragraph::new(format!(
-        " {}   (합계: {})",
-        app.current.display(),
-        human(app.total_size())
-    ))
-    .block(Block::default().borders(Borders::ALL).title(" mac-du "));
+    // 헤더: 스캔 중이면 스피너와 대상 경로, 아니면 현재 경로와 총 용량
+    const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    let header_text = match &app.scanning {
+        Some(dir) => format!(
+            " {} 스캔 중… {}",
+            SPINNER[app.tick / 2 % SPINNER.len()],
+            dir.display()
+        ),
+        None => {
+            let took = app
+                .last_scan
+                .map(|d| format!(" · 스캔 {:.2}초", d.as_secs_f64()))
+                .unwrap_or_default();
+            format!(
+                " {}   (합계: {}{})",
+                app.current.display(),
+                human(app.total_size()),
+                took
+            )
+        }
+    };
+    let header = Paragraph::new(header_text)
+        .block(Block::default().borders(Borders::ALL).title(" mac-du "));
     f.render_widget(header, chunks[0]);
 
     // 목록: 용량 막대 + 비율 + 이름
