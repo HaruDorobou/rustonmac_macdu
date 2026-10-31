@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use ratatui::widgets::ListState;
 
 use crate::clipboard;
+use crate::finder;
 use crate::scanner::{self, ErrorReport, Node, ScanError, ScanOutput};
 
 /// 감시 간격의 최솟값(초). 이보다 짧으면 스캔이 겹치거나 디스크를 계속 읽게 된다.
@@ -145,6 +146,8 @@ pub struct App {
     notice: Option<(String, Instant)>,
     /// 텍스트를 클립보드에 넣는 함수. 테스트가 실제 클립보드를 덮어쓰지 않도록 바꿔 끼울 수 있다.
     copier: Box<dyn FnMut(&str) -> io::Result<()>>,
+    /// `open`을 부르는 함수. 테스트가 Finder 창을 띄우지 않도록 바꿔 끼울 수 있다.
+    opener: Box<dyn FnMut(&[&str]) -> io::Result<()>>,
     changes: Changes,
     rx: Option<Receiver<ScanDone>>,
 }
@@ -185,6 +188,7 @@ impl App {
             last_change: None,
             notice: None,
             copier: Box::new(clipboard::copy),
+            opener: Box::new(finder::open),
             changes: Changes::default(),
             rx: None,
         };
@@ -479,6 +483,44 @@ impl App {
             .as_ref()
             .filter(|(_, at)| at.elapsed() < NOTICE_VISIBLE)
             .map(|(msg, _)| msg.as_str())
+    }
+
+    // ---- Finder -----------------------------------------------------------
+
+    /// 하이라이트된 항목을 Finder에서 선택된 상태로 보여 준다 (`open -R`).
+    pub fn reveal_selected(&mut self) {
+        let Some(path) = self.selected_path() else {
+            self.status = Some("열 항목이 없습니다".into());
+            return;
+        };
+        // Finder는 `.`으로 시작하는 항목을 기본으로 보여 주지 않는다
+        let hidden = self.selected_name().is_some_and(|n| n.starts_with('.'));
+        let text = path.to_string_lossy().into_owned();
+        self.run_open(&["-R", &text], format!("Finder에서 보기: {text}"), hidden);
+    }
+
+    /// 지금 보고 있는 폴더를 Finder에서 연다 (`open`).
+    pub fn open_current(&mut self) {
+        let text = self.current.to_string_lossy().into_owned();
+        self.run_open(&[&text], format!("Finder에서 열기: {text}"), false);
+    }
+
+    fn run_open(&mut self, args: &[&str], done: String, hidden: bool) {
+        match (self.opener)(args) {
+            Ok(()) => {
+                self.status = None;
+                let msg = if hidden {
+                    format!("{done}  (숨김 항목입니다. Finder에서 ⌘⇧. 로 표시)")
+                } else {
+                    done
+                };
+                self.notice = Some((msg, Instant::now()));
+            }
+            Err(e) => {
+                self.notice = None;
+                self.status = Some(format!("Finder를 열지 못했습니다: {e}"));
+            }
+        }
     }
 
     // ---- 오류 목록 --------------------------------------------------------
@@ -1050,6 +1092,102 @@ mod tests {
         app.copier = Box::new(|_| Err(io::Error::other("no clipboard")));
         app.copy_current();
         assert!(app.status.as_deref().unwrap().contains("복사하지 못했습니다"));
+        assert!(app.notice().is_none());
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Finder를 띄우지 않도록 `open` 호출을 기록용으로 바꾼 앱
+    fn app_with_recording_opener(
+        dir: &Path,
+    ) -> (App, std::rc::Rc<std::cell::RefCell<Vec<Vec<String>>>>) {
+        let calls = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut app = App::new(dir.to_path_buf());
+        let sink = calls.clone();
+        app.opener = Box::new(move |args| {
+            sink.borrow_mut().push(args.iter().map(|a| a.to_string()).collect());
+            Ok(())
+        });
+        wait(&mut app);
+        (app, calls)
+    }
+
+    #[test]
+    fn o_reveals_the_highlighted_item_and_capital_o_opens_the_current_folder() {
+        let root = temp_root("finder");
+        fs::write(root.join("내 큰 파일.bin"), vec![1u8; 300_000]).unwrap();
+        fs::create_dir_all(root.join("sub dir")).unwrap();
+        fs::write(root.join("sub dir/inner.txt"), vec![1u8; 10_000]).unwrap();
+
+        let (mut app, calls) = app_with_recording_opener(&root);
+        app.reveal_selected();
+        assert_eq!(
+            calls.borrow()[0],
+            ["-R".to_string(), root.join("내 큰 파일.bin").to_string_lossy().into_owned()]
+        );
+        let notice = app.notice().unwrap().to_string();
+        assert!(notice.contains("Finder에서 보기"), "{notice}");
+        assert!(!notice.contains("숨김"), "a normal file needs no hidden-item hint: {notice}");
+
+        app.open_current();
+        assert_eq!(calls.borrow()[1], [root.to_string_lossy().into_owned()]);
+
+        // 폴더 안에서는 그 폴더가 열리고, 항목은 전체 경로로 전달된다
+        app.state.select(Some(1));
+        app.enter();
+        app.open_current();
+        app.reveal_selected();
+        assert_eq!(calls.borrow()[2], [root.join("sub dir").to_string_lossy().into_owned()]);
+        assert_eq!(
+            calls.borrow()[3],
+            ["-R".to_string(), root.join("sub dir/inner.txt").to_string_lossy().into_owned()]
+        );
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn revealing_a_hidden_item_tells_how_to_see_it_in_finder() {
+        let root = temp_root("finder-hidden");
+        fs::create_dir_all(root.join(".cache")).unwrap();
+        fs::write(root.join(".cache/blob"), vec![1u8; 300_000]).unwrap();
+        fs::write(root.join("visible.txt"), vec![1u8; 1_000]).unwrap();
+
+        let (mut app, calls) = app_with_recording_opener(&root);
+        assert_eq!(names(&app)[0], ".cache");
+        app.reveal_selected();
+        assert_eq!(calls.borrow()[0][0], "-R");
+        let notice = app.notice().unwrap().to_string();
+        assert!(notice.contains("숨김 항목") && notice.contains("⌘⇧."), "{notice}");
+
+        // 숨김 폴더 안의 일반 이름은 힌트가 필요 없다
+        app.enter();
+        app.reveal_selected();
+        assert!(!app.notice().unwrap().contains("숨김"));
+
+        // 폴더 자체를 여는 것은 숨김 힌트와 무관하다
+        app.open_current();
+        assert!(!app.notice().unwrap().contains("숨김"));
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn finder_errors_and_empty_folders_are_reported() {
+        let root = temp_root("finder-err");
+        fs::create_dir_all(root.join("empty")).unwrap();
+
+        let (mut app, calls) = app_with_recording_opener(&root);
+        app.enter(); // 빈 폴더
+        app.reveal_selected();
+        assert_eq!(app.status.as_deref(), Some("열 항목이 없습니다"));
+        assert!(calls.borrow().is_empty());
+
+        app.status = None;
+        app.opener = Box::new(|_| Err(io::Error::other("The file does not exist.")));
+        app.open_current();
+        let status = app.status.as_deref().unwrap();
+        assert!(status.contains("Finder를 열지 못했습니다") && status.contains("does not exist"));
         assert!(app.notice().is_none());
 
         fs::remove_dir_all(&root).unwrap();

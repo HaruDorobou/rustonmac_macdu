@@ -243,15 +243,64 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     } else if let Some(msg) = app.notice() {
         Paragraph::new(format!(" ✓ {}", msg)).style(Style::default().fg(Color::Green))
     } else {
-        let watch_hint = if app.watch.is_some() { "  +/- 간격" } else { "" };
-        let errors_hint = if app.unreadable_here() > 0 { "  e 오류" } else { "" };
-        Paragraph::new(format!(
-            " j/k 이동  l 들어가기  h 상위  r 다시 스캔  p 위쪽 스캔  w 감시{}  y/Y 경로 복사{}  q 종료",
-            watch_hint, errors_hint
-        ))
-        .style(Style::default().fg(Color::DarkGray))
+        let items = help_items(app.watch.is_some(), app.unreadable_here() > 0);
+        Paragraph::new(help_line(&items, area.width as usize))
+            .style(Style::default().fg(Color::DarkGray))
     };
     f.render_widget(footer, area);
+}
+
+/// 키 도움말 항목: (중요도, 문구). 목록 순서가 화면에 보이는 순서이고,
+/// 중요도가 낮은 숫자일수록 먼저 남는다. 0은 폭이 아무리 좁아도 남긴다.
+fn help_items(watching: bool, has_errors: bool) -> Vec<(u8, String)> {
+    let mut items = vec![
+        (1, "j/k 이동".to_string()),
+        (1, "l 들어가기".to_string()),
+        (1, "h 상위".to_string()),
+        (3, "r 갱신".to_string()),
+        (6, "p 위쪽".to_string()),
+        (5, "w 감시".to_string()),
+    ];
+    if watching {
+        items.push((7, "+/- 간격".to_string()));
+    }
+    items.push((4, "y/Y 복사".to_string()));
+    items.push((4, "o/O Finder".to_string()));
+    if has_errors {
+        items.push((2, "e 오류".to_string()));
+    }
+    items.push((0, "q 종료".to_string()));
+    items
+}
+
+/// `width` 칸 안에 들어가도록 중요한 항목부터 채워서 한 줄로 만든다.
+/// 보이는 순서는 `items`의 원래 순서를 따른다.
+fn help_line(items: &[(u8, String)], width: usize) -> String {
+    const SEP: &str = "  ";
+    let avail = width.saturating_sub(1); // 맨 앞 공백 한 칸
+    let w = |s: &str| Span::raw(s.to_string()).width();
+
+    let mut order: Vec<usize> = (0..items.len()).collect();
+    order.sort_by_key(|&i| items[i].0); // 같은 중요도는 원래 순서 유지(stable)
+
+    let mut keep = vec![false; items.len()];
+    let mut used = 0;
+    for i in order {
+        let add = w(&items[i].1) + if used == 0 { 0 } else { w(SEP) };
+        // 중요도 0은 폭이 모자라도 반드시 남긴다
+        if items[i].0 == 0 || used + add <= avail {
+            keep[i] = true;
+            used += add;
+        }
+    }
+
+    let shown: Vec<&str> = items
+        .iter()
+        .zip(keep)
+        .filter(|(_, k)| *k)
+        .map(|(it, _)| it.1.as_str())
+        .collect();
+    format!(" {}", shown.join(SEP))
 }
 
 /// 읽지 못한 경로 목록을 화면 가운데 팝업으로 보여 준다.
@@ -394,6 +443,61 @@ mod tests {
             at: Instant::now(),
         };
         assert_eq!(change_label(&c), "NEW 5.0 KB");
+    }
+
+    fn items() -> Vec<(u8, String)> {
+        [(1, "j/k 이동"), (3, "r 갱신"), (5, "w 감시"), (4, "o/O Finder"), (0, "q 종료")]
+            .iter()
+            .map(|(p, s)| (*p, s.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn the_help_line_shows_everything_when_there_is_room() {
+        let line = help_line(&items(), 200);
+        assert_eq!(line, " j/k 이동  r 갱신  w 감시  o/O Finder  q 종료");
+    }
+
+    #[test]
+    fn the_help_line_drops_the_least_important_items_first_but_never_the_quit_hint() {
+        let full = help_line(&items(), 200);
+        let full_width = Span::raw(full).width();
+
+        for width in [full_width - 1, 40, 30, 20, 10, 1] {
+            let line = help_line(&items(), width);
+            assert!(line.contains("q 종료"), "quit hint missing at width {width}: {line:?}");
+            // 폭이 허용하는 한 넘치지 않는다 (q만 남는 극단적으로 좁은 경우는 예외)
+            if width >= Span::raw(" q 종료").width() {
+                assert!(Span::raw(line.clone()).width() <= width, "too wide at {width}: {line:?}");
+            }
+        }
+        // 한 칸 줄이면 가장 덜 중요한 w 감시(5)부터 빠진다
+        let line = help_line(&items(), full_width - 1);
+        assert!(!line.contains("w 감시") && line.contains("o/O Finder") && line.contains("r 갱신"));
+        // 보이는 순서는 원래 순서 그대로
+        assert!(line.find("j/k").unwrap() < line.find("r 갱신").unwrap());
+    }
+
+    #[test]
+    fn the_real_key_help_fits_a_80_column_terminal_in_every_state() {
+        for (watching, has_errors) in [(false, false), (true, false), (false, true), (true, true)] {
+            let line = help_line(&help_items(watching, has_errors), 80);
+            let width = Span::raw(line.clone()).width();
+            assert!(width <= 80, "{width} columns for watching={watching} errors={has_errors}: {line:?}");
+            // 이동, 종료, 그리고 새로 넣은 Finder 키는 80칸에서도 남아 있어야 한다
+            for must in ["j/k 이동", "l 들어가기", "h 상위", "q 종료", "o/O Finder"] {
+                assert!(line.contains(must), "{must:?} missing: {line:?}");
+            }
+            // 오류가 있으면 e 키 안내가 가장 먼저 남는 부가 항목이다
+            if has_errors {
+                assert!(line.contains("e 오류"), "{line:?}");
+            }
+        }
+        // 넓은 터미널에서는 전부 보인다
+        let wide = help_line(&help_items(true, true), 200);
+        for all in ["p 위쪽", "w 감시", "+/- 간격", "y/Y 복사", "e 오류"] {
+            assert!(wide.contains(all), "{all:?} missing: {wide:?}");
+        }
     }
 
     #[test]

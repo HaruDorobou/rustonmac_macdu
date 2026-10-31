@@ -1,6 +1,7 @@
 mod app;
 mod cli;
 mod clipboard;
+mod finder;
 mod scanner;
 mod ui;
 
@@ -119,6 +120,8 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> io::
                     KeyCode::Char('p') => app.open_expand(),
                     KeyCode::Char('y') => app.copy_selected(),
                     KeyCode::Char('Y') => app.copy_current(),
+                    KeyCode::Char('o') => app.reveal_selected(),
+                    KeyCode::Char('O') => app.open_current(),
                     KeyCode::Char('e') => app.toggle_errors(),
                     KeyCode::Char('r') => app.rescan(),
                     KeyCode::Char('w') => app.toggle_watch(),
