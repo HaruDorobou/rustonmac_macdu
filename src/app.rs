@@ -72,6 +72,8 @@ struct ScanDone {
     dir: PathBuf,
     target: Target,
     result: io::Result<ScanOutput>,
+    /// 이 스캔의 시작 시각. 읽은 노드마다 기록된 `scanned`와 같은 값이다.
+    stamp: u32,
     /// 스캔 스레드 안에서 잰 소요 시간 (UI 렌더링 시간 제외)
     elapsed: Duration,
 }
@@ -148,6 +150,10 @@ pub struct App {
     copier: Box<dyn FnMut(&str) -> io::Result<()>>,
     /// `open`을 부르는 함수. 테스트가 Finder 창을 띄우지 않도록 바꿔 끼울 수 있다.
     opener: Box<dyn FnMut(&[&str]) -> io::Result<()>>,
+    /// 현재 시각(유닉스 초)을 돌려주는 함수. 테스트가 시각을 정할 수 있게 바꿔 끼울 수 있다.
+    clock: Box<dyn Fn() -> u32>,
+    /// 스캔 시작 시각별 소요 시간. 헤더의 "N분 전 스캔 · N초 소요"를 같은 스캔 기준으로 맞춘다.
+    scan_durations: Vec<(u32, Duration)>,
     changes: Changes,
     rx: Option<Receiver<ScanDone>>,
 }
@@ -161,6 +167,10 @@ impl App {
     /// `root` 전체를 미리 스캔해 두고 `start`에서 시작한다. 그러면 `root` 아래에서는 어느
     /// 폴더로 오가도 다시 스캔하지 않는다. `start`가 `root` 밖이면 `root`에서 시작한다.
     pub fn with_root(start: PathBuf, root: PathBuf) -> Self {
+        Self::build(start, root, Box::new(scanner::now_secs))
+    }
+
+    fn build(start: PathBuf, root: PathBuf, clock: Box<dyn Fn() -> u32>) -> Self {
         let open = start.starts_with(&root).then_some(start);
         let mut app = Self {
             tree_root: root.clone(),
@@ -189,6 +199,8 @@ impl App {
             notice: None,
             copier: Box::new(clipboard::copy),
             opener: Box::new(finder::open),
+            clock,
+            scan_durations: Vec::new(),
             changes: Changes::default(),
             rx: None,
         };
@@ -614,16 +626,18 @@ impl App {
         self.expanding = matches!(target, Target::Expand { .. });
         // 범위를 넓힐 때는 이미 스캔한 현재 트리를 다시 읽지 않도록 건너뛴다
         let skip = self.expanding.then(|| self.tree_root.clone());
+        let stamp = (self.clock)();
 
         thread::spawn(move || {
             let started = Instant::now();
-            let result = scanner::scan_tree_skipping(&dir, skip.as_deref());
+            let result = scanner::scan_tree_skipping(&dir, skip.as_deref(), stamp);
             let elapsed = started.elapsed();
             // 수신 쪽이 이미 종료됐다면 보낼 곳이 없을 뿐이므로 무시한다
             let _ = tx.send(ScanDone {
                 dir,
                 target,
                 result,
+                stamp,
                 elapsed,
             });
         });
@@ -737,6 +751,32 @@ impl App {
 
         self.last_scan = Some(done.elapsed);
         self.last_checked = Some(Instant::now());
+        self.scan_durations.push((done.stamp, done.elapsed));
+        // 오래된 기록은 버린다. 화면에 남아 있는 데이터가 참조하는 스캔은 최근 것들뿐이다.
+        if self.scan_durations.len() > 64 {
+            self.scan_durations.remove(0);
+        }
+    }
+
+    /// 지금 시각(유닉스 초)
+    pub fn now(&self) -> u32 {
+        (self.clock)()
+    }
+
+    /// 지금 보고 있는 폴더의 데이터를 읽은 시각. 일부만 다시 스캔해 시각이 섞여 있으면
+    /// 가장 오래된 쪽이다. 아직 스캔하기 전이면 `None`.
+    pub fn scanned_at(&self) -> Option<u32> {
+        let t = self.current_node().oldest;
+        (t != 0 && t != u32::MAX).then_some(t)
+    }
+
+    /// 시작 시각이 `stamp`인 스캔이 걸린 시간
+    pub fn scan_duration_at(&self, stamp: u32) -> Option<Duration> {
+        self.scan_durations
+            .iter()
+            .rev()
+            .find(|(s, _)| *s == stamp)
+            .map(|(_, d)| *d)
     }
 
     /// 갱신 전후의 현재 폴더 항목 크기를 비교해 달라진 것을 기록한다.
@@ -1024,6 +1064,92 @@ mod tests {
         assert!(app.scanning.is_none(), "going up is instant now");
         assert_eq!(app.current, root);
         assert_eq!(names(&app), ["z", "a"]);
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// 시각을 테스트가 정하는 앱. 반환된 `Cell`을 바꾸면 이후 스캔이 그 시각으로 기록된다.
+    fn app_with_clock(
+        start: &Path,
+        root: &Path,
+        now: u32,
+    ) -> (App, std::rc::Rc<std::cell::Cell<u32>>) {
+        let clock = std::rc::Rc::new(std::cell::Cell::new(now));
+        let c = clock.clone();
+        let app = App::build(start.to_path_buf(), root.to_path_buf(), Box::new(move || c.get()));
+        (app, clock)
+    }
+
+    #[test]
+    fn the_scan_time_follows_the_data_through_partial_refreshes() {
+        let root = temp_root("age");
+        fs::create_dir_all(root.join("a/b")).unwrap();
+        fs::create_dir_all(root.join("c")).unwrap();
+        fs::write(root.join("a/b/f"), vec![1u8; 10_000]).unwrap();
+        fs::write(root.join("c/f"), vec![1u8; 100_000]).unwrap();
+
+        let (mut app, clock) = app_with_clock(&root, &root, 1000);
+        assert_eq!(app.scanned_at(), None, "nothing is shown before the first scan finishes");
+        wait(&mut app);
+        assert_eq!(app.scanned_at(), Some(1000));
+        assert!(app.scan_duration_at(1000).is_some(), "the scan's duration is kept by its start time");
+
+        // 시각이 지난 뒤, 폴더를 오가기만 하면 시각은 그대로다 (다시 읽지 않으므로)
+        clock.set(2000);
+        let a = names(&app).iter().position(|n| n == "a").unwrap();
+        app.state.select(Some(a));
+        app.enter();
+        app.enter(); // a/b
+        assert_eq!(app.scanned_at(), Some(1000), "moving around does not refresh anything");
+        assert_eq!(app.now(), 2000);
+
+        // a/b만 다시 읽으면 그 폴더는 2000, 위쪽은 여전히 가장 오래된 1000이다
+        app.rescan();
+        wait(&mut app);
+        assert_eq!(app.scanned_at(), Some(2000));
+        assert!(app.scan_duration_at(2000).is_some());
+        app.back(); // a: 목록은 1000에 읽었고 b만 2000
+        assert_eq!(app.scanned_at(), Some(1000));
+        app.back(); // 루트
+        assert_eq!(app.scanned_at(), Some(1000));
+        let a_node = app.children().iter().find(|c| &*c.name == "a").unwrap();
+        assert_eq!((a_node.scanned, a_node.oldest), (1000, 1000));
+
+        // 루트를 통째로 다시 읽으면 전부 3000이 된다
+        clock.set(3000);
+        app.rescan();
+        wait(&mut app);
+        assert_eq!(app.scanned_at(), Some(3000));
+        assert!(app.children().iter().all(|c| c.oldest == 3000));
+        // 이전 스캔들의 소요 시간도 시각으로 찾을 수 있다
+        assert!(app.scan_duration_at(1000).is_some() && app.scan_duration_at(2000).is_some());
+        assert!(app.scan_duration_at(1234).is_none());
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn widening_the_cache_keeps_the_old_subtree_at_its_old_time() {
+        let root = temp_root("age-expand");
+        fs::create_dir_all(root.join("x")).unwrap();
+        fs::create_dir_all(root.join("y")).unwrap();
+        fs::write(root.join("x/f"), vec![1u8; 1_000]).unwrap();
+        fs::write(root.join("y/f"), vec![1u8; 100_000]).unwrap();
+
+        let (mut app, clock) = app_with_clock(&root.join("x"), &root.join("x"), 1000);
+        wait(&mut app);
+        assert_eq!(app.scanned_at(), Some(1000));
+
+        clock.set(5000);
+        app.back(); // x 위로: 부모를 읽되 x는 재사용
+        wait(&mut app);
+
+        assert_eq!(app.current, root);
+        let age = |name: &str| app.children().iter().find(|c| &*c.name == name).unwrap().oldest;
+        assert_eq!(age("x"), 1000, "x was reused, so it keeps the time it was read");
+        assert_eq!(age("y"), 5000, "y was read just now");
+        assert_eq!(app.scanned_at(), Some(1000), "the folder is as old as its oldest part");
+        assert!(app.scan_duration_at(1000).is_some() && app.scan_duration_at(5000).is_some());
 
         fs::remove_dir_all(&root).unwrap();
     }

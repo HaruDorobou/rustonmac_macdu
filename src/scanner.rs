@@ -5,6 +5,7 @@ use std::io;
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use rayon::prelude::*;
 
@@ -23,8 +24,21 @@ pub struct Node {
     /// 이 노드 안(폴더면 하위 전체, 노드 자체를 못 읽었으면 자기 자신 포함)에서
     /// 읽지 못한 경로의 수
     pub unreadable: u32,
+    /// 이 노드를 읽은 스캔의 시작 시각 (유닉스 시각, 초). 파일은 부모 폴더와 같은 값이다.
+    pub scanned: u32,
+    /// 이 노드와 그 아래 전체 중 가장 오래된 스캔 시각. 일부만 다시 스캔한 폴더는
+    /// 오래된 부분과 새 부분이 섞이는데, 데이터를 믿어도 되는지 판단하는 기준이라 가장 오래된 쪽을 쓴다.
+    pub oldest: u32,
     /// 폴더면 하위 항목들 (크기 내림차순). 파일이면 비어 있다.
     pub children: Box<[Node]>,
+}
+
+/// 현재 시각 (유닉스 시각, 초). 노드마다 4바이트로 저장하려고 `u32`를 쓴다.
+/// 벽시계를 쓰는 이유: 노트북이 잠든 시간도 "얼마나 오래됐는지"에 포함되어야 한다.
+pub fn now_secs() -> u32 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs().min(u32::MAX as u64) as u32)
 }
 
 impl Node {
@@ -34,6 +48,22 @@ impl Node {
             is_dir: true,
             size: 0,
             unreadable: 0,
+            scanned: 0,
+            oldest: 0,
+            children: Box::new([]),
+        }
+    }
+
+    /// 아직 읽지 않은 폴더의 자리표시. `oldest`를 `u32::MAX`로 둬서, 나중에 실제 내용을
+    /// 끼워 넣기 전까지 상위 폴더의 "가장 오래된 시각" 계산을 오염시키지 않는다.
+    fn placeholder(name: Box<str>, stamp: u32) -> Self {
+        Node {
+            name,
+            is_dir: true,
+            size: 0,
+            unreadable: 0,
+            scanned: stamp,
+            oldest: u32::MAX,
             children: Box::new([]),
         }
     }
@@ -67,6 +97,13 @@ impl Node {
         }
         self.size = self.children.iter().map(|c| c.size).sum();
         self.unreadable = self.children.iter().map(|c| c.unreadable).sum();
+        // 이 폴더의 목록 자체는 다시 읽지 않았으므로 `scanned`는 그대로 두고, 아래에서 바뀐 만큼만 반영한다
+        self.oldest = self
+            .children
+            .iter()
+            .map(|c| c.oldest)
+            .min()
+            .map_or(self.scanned, |m| m.min(self.scanned));
         self.children.sort_by(|a, b| b.size.cmp(&a.size));
         true
     }
@@ -160,15 +197,20 @@ pub fn init_thread_pool(threads: Option<usize>) {
 /// `root` 자체를 열 수 없으면 `Err`. 그 아래에서 읽지 못한 경로는 `errors`에 모은다.
 #[cfg(test)]
 pub fn scan_tree(root: &Path) -> io::Result<ScanOutput> {
-    scan_tree_skipping(root, None)
+    scan_tree_skipping(root, None, now_secs())
 }
 
 /// `scan_tree`와 같지만 `skip` 폴더는 읽지 않고 비어 있는 자리표시 노드로 남긴다.
 /// 이미 스캔해 둔 하위 트리를 `Node::replace_at`으로 끼워 넣을 때 쓴다.
-pub fn scan_tree_skipping(root: &Path, skip: Option<&Path>) -> io::Result<ScanOutput> {
+/// `stamp`는 이 스캔의 시작 시각으로, 읽은 모든 노드에 기록된다.
+pub fn scan_tree_skipping(
+    root: &Path,
+    skip: Option<&Path>,
+    stamp: u32,
+) -> io::Result<ScanOutput> {
     let log = ErrorLog::default();
     let raws = read_dir_bulk(root, &log)?;
-    let root = build_dir_node("".into(), root, raws, &log, skip);
+    let root = build_dir_node("".into(), root, raws, &log, skip, stamp);
     Ok(ScanOutput {
         root,
         errors: log.into_report(),
@@ -176,9 +218,15 @@ pub fn scan_tree_skipping(root: &Path, skip: Option<&Path>) -> io::Result<ScanOu
 }
 
 /// 폴더를 열어서 노드로 만든다. 열지 못하면 오류를 기록하고 비어 있는 노드를 돌려준다.
-fn scan_dir_node(name: Box<str>, path: &Path, log: &ErrorLog, skip: Option<&Path>) -> Node {
+fn scan_dir_node(
+    name: Box<str>,
+    path: &Path,
+    log: &ErrorLog,
+    skip: Option<&Path>,
+    stamp: u32,
+) -> Node {
     match read_dir_bulk(path, log) {
-        Ok(raws) => build_dir_node(name, path, raws, log, skip),
+        Ok(raws) => build_dir_node(name, path, raws, log, skip, stamp),
         Err(e) => {
             log.push(path.to_path_buf(), e.raw_os_error().unwrap_or(0));
             Node {
@@ -186,6 +234,8 @@ fn scan_dir_node(name: Box<str>, path: &Path, log: &ErrorLog, skip: Option<&Path
                 is_dir: true,
                 size: 0,
                 unreadable: 1,
+                scanned: stamp,
+                oldest: stamp,
                 children: Box::new([]),
             }
         }
@@ -200,6 +250,7 @@ fn build_dir_node(
     raws: Vec<Raw>,
     log: &ErrorLog,
     skip: Option<&Path>,
+    stamp: u32,
 ) -> Node {
     // 파일은 값싸게 바로 처리하고, 하위 폴더만 병렬로 재귀한다
     let (dirs, others): (Vec<Raw>, Vec<Raw>) = raws
@@ -212,6 +263,8 @@ fn build_dir_node(
             is_dir: r.kind == Kind::Dir,
             size: r.alloc,
             unreadable: u32::from(r.failed),
+            scanned: stamp,
+            oldest: stamp,
             name: r.name.into_boxed_str(),
             children: Box::new([]),
         })
@@ -222,15 +275,9 @@ fn build_dir_node(
         let name = r.name.into_boxed_str();
         if skip == Some(child_path.as_path()) {
             // 이미 스캔해 둔 폴더. 읽지 않고 자리만 잡아 두면 나중에 끼워 넣는다.
-            return Node {
-                name,
-                is_dir: true,
-                size: 0,
-                unreadable: 0,
-                children: Box::new([]),
-            };
+            return Node::placeholder(name, stamp);
         }
-        scan_dir_node(name, &child_path, log, skip)
+        scan_dir_node(name, &child_path, log, skip, stamp)
     }));
 
     children.sort_unstable_by(|a, b| b.size.cmp(&a.size));
@@ -239,6 +286,12 @@ fn build_dir_node(
         is_dir: true,
         size: children.iter().map(|c| c.size).sum(),
         unreadable: children.iter().map(|c| c.unreadable).sum(),
+        scanned: stamp,
+        oldest: children
+            .iter()
+            .map(|c| c.oldest)
+            .min()
+            .map_or(stamp, |m| m.min(stamp)),
         children: children.into_boxed_slice(),
     }
 }
@@ -536,7 +589,7 @@ mod tests {
 
         let full = scan_tree(&root).unwrap();
         let known = scan_tree(&root.join("known")).unwrap();
-        let mut partial = scan_tree_skipping(&root, Some(&root.join("known"))).unwrap();
+        let mut partial = scan_tree_skipping(&root, Some(&root.join("known")), now_secs()).unwrap();
         fs::remove_dir_all(&root).unwrap();
 
         // 건너뛴 폴더는 비어 있는 자리표시만 남는다
@@ -555,6 +608,51 @@ mod tests {
             full.root.find(&["known".into(), "deep".into()]).unwrap().size
         );
         assert!(partial.root.find(&["nope".into()]).is_none());
+    }
+
+    #[test]
+    fn nodes_remember_when_they_were_scanned_and_grafting_keeps_older_times() {
+        let root = temp_root("stamps");
+        fs::create_dir_all(root.join("known/deep")).unwrap();
+        fs::create_dir_all(root.join("other")).unwrap();
+        fs::write(root.join("known/deep/f"), vec![1u8; 80_000]).unwrap();
+        fs::write(root.join("other/f"), vec![1u8; 30_000]).unwrap();
+        fs::write(root.join("top"), vec![1u8; 5_000]).unwrap();
+        let known = |n: &Node| -> (u32, u32) { (n.scanned, n.oldest) };
+
+        // known은 시각 100에 이미 스캔해 둔 상태, 위쪽은 시각 900에 known을 건너뛰고 스캔
+        let old = scan_tree_skipping(&root.join("known"), None, 100).unwrap();
+        let mut full = scan_tree_skipping(&root, Some(&root.join("known")), 900).unwrap();
+
+        // 자리표시가 가장 오래된 시각을 0이나 엉뚱한 값으로 끌어내리면 안 된다
+        assert_eq!(known(&full.root), (900, 900));
+
+        assert!(full.root.replace_at(&["known".to_string()], old.root));
+        // 루트 목록은 900에 읽었지만 known 아래는 100에 읽은 것이다
+        assert_eq!(known(&full.root), (900, 100));
+        let k = child(&full.root, "known");
+        assert_eq!(known(k), (100, 100));
+        let deep = child(k, "deep");
+        assert_eq!(known(deep), (100, 100));
+        assert_eq!(child(deep, "f").scanned, 100, "files carry their folder's scan time");
+        assert_eq!(known(child(&full.root, "other")), (900, 900));
+        assert_eq!(child(&full.root, "top").scanned, 900);
+
+        // known/deep만 2000에 다시 읽어도, known 목록 자체는 100에 읽은 그대로다
+        let fresh = scan_tree_skipping(&root.join("known/deep"), None, 2000).unwrap();
+        assert!(full.root.replace_at(&["known".to_string(), "deep".to_string()], fresh.root));
+        let k = child(&full.root, "known");
+        assert_eq!(known(k), (100, 100));
+        assert_eq!(known(child(k, "deep")), (2000, 2000));
+        assert_eq!(known(&full.root), (900, 100));
+
+        // known 전체를 3000에 다시 읽으면 가장 오래된 것은 루트 목록의 900이 된다
+        let fresh = scan_tree_skipping(&root.join("known"), None, 3000).unwrap();
+        assert!(full.root.replace_at(&["known".to_string()], fresh.root));
+        assert_eq!(known(child(&full.root, "known")), (3000, 3000));
+        assert_eq!(known(&full.root), (900, 900));
+
+        fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

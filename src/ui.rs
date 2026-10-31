@@ -85,10 +85,19 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
             line1.push(Span::raw(format!(" {} 스캔 중… {}", spinner, dir.display())));
         }
         _ => {
-            let took = app
-                .last_scan
-                .map(|d| format!(" · 스캔 {:.2}초", d.as_secs_f64()))
-                .unwrap_or_default();
+            // 이 폴더 데이터를 읽은 시점(일부만 갱신했다면 가장 오래된 부분 기준)과,
+            // 같은 스캔이 걸린 시간. 폴더를 오가도 다시 스캔하지 않으므로 이 숫자가
+            // 곧 "지금 보는 데이터가 얼마나 오래됐는지"다.
+            let took = match app.scanned_at() {
+                Some(at) => {
+                    let age = age_label(app.now().saturating_sub(at) as u64);
+                    match app.scan_duration_at(at) {
+                        Some(d) => format!(" · {age} 스캔 · {:.2}초 소요", d.as_secs_f64()),
+                        None => format!(" · {age} 스캔"),
+                    }
+                }
+                None => String::new(),
+            };
             // 읽지 못한 경로가 있으면 합계는 실제보다 작을 수 있다
             let at_least = if app.unreadable_here() > 0 { "≥ " } else { "" };
             line1.push(Span::raw(format!(
@@ -396,15 +405,26 @@ fn change_label(c: &Change) -> String {
     }
 }
 
-/// `3초 전` / `2분 전` / `1시간 전`
+/// `3초 전` / `2분 전` / `1시간 전` / `3일 전`
 fn ago(d: Duration) -> String {
     let s = d.as_secs();
     if s < 60 {
         format!("{}초 전", s)
     } else if s < 3600 {
         format!("{}분 전", s / 60)
-    } else {
+    } else if s < 86_400 {
         format!("{}시간 전", s / 3600)
+    } else {
+        format!("{}일 전", s / 86_400)
+    }
+}
+
+/// 스캔한 지 `secs`초가 지난 데이터의 나이. 5초 안이면 `방금`.
+fn age_label(secs: u64) -> String {
+    if secs < 5 {
+        "방금".to_string()
+    } else {
+        ago(Duration::from_secs(secs))
     }
 }
 
@@ -505,5 +525,20 @@ mod tests {
         assert_eq!(ago(Duration::from_secs(4)), "4초 전");
         assert_eq!(ago(Duration::from_secs(125)), "2분 전");
         assert_eq!(ago(Duration::from_secs(7300)), "2시간 전");
+        assert_eq!(ago(Duration::from_secs(86_399)), "23시간 전");
+        assert_eq!(ago(Duration::from_secs(86_400)), "1일 전");
+        assert_eq!(ago(Duration::from_secs(3 * 86_400 + 5)), "3일 전");
+    }
+
+    #[test]
+    fn data_age_reads_as_just_now_then_counts_up() {
+        assert_eq!(age_label(0), "방금");
+        assert_eq!(age_label(4), "방금");
+        assert_eq!(age_label(5), "5초 전");
+        assert_eq!(age_label(59), "59초 전");
+        assert_eq!(age_label(60), "1분 전");
+        assert_eq!(age_label(3 * 3600), "3시간 전");
+        // 시계가 거꾸로 가도(saturating_sub으로 0) 이상한 값이 나오지 않는다
+        assert_eq!(age_label(0u32.saturating_sub(10) as u64), "방금");
     }
 }
