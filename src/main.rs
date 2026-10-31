@@ -15,6 +15,8 @@ use ratatui::{backend::CrosstermBackend, Terminal};
 use app::App;
 
 fn main() -> io::Result<()> {
+    // App::new가 곧바로 스캔을 시작하므로, 그보다 먼저 스레드 풀을 설정해야 한다
+    scanner::init_thread_pool();
     let mut app = App::new(std::env::current_dir()?);
 
     enable_raw_mode()?;

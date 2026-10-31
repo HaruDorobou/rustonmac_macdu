@@ -16,6 +16,28 @@ pub struct Entry {
     pub size: u64,
 }
 
+/// 스캔에 쓰는 스레드 수의 상한.
+/// 실측(16코어 기기): 16스레드까지는 스레드가 늘수록 빨라지고 안정적이었지만,
+/// 20스레드 이상에서는 5~7초씩 멈추는 현상이 반복됐다.
+const MAX_SCAN_THREADS: usize = 16;
+
+fn scan_threads(cpus: usize) -> usize {
+    cpus.clamp(1, MAX_SCAN_THREADS)
+}
+
+/// 스캔용 rayon 스레드 풀을 설정한다. 스캔을 시작하기 전에 한 번 호출해야 한다.
+/// 실험용으로 `RAYON_NUM_THREADS`가 지정돼 있으면 그 값을 존중한다.
+pub fn init_thread_pool() {
+    if std::env::var_os("RAYON_NUM_THREADS").is_some() {
+        return;
+    }
+    let cpus = std::thread::available_parallelism().map_or(4, |n| n.get());
+    // 이미 전역 풀이 만들어져 있으면 실패하지만, 그대로 쓰면 되므로 무시한다
+    let _ = rayon::ThreadPoolBuilder::new()
+        .num_threads(scan_threads(cpus))
+        .build_global();
+}
+
 /// `root`의 직계 자식들을 병렬로 스캔해 용량 내림차순으로 반환한다.
 pub fn scan_dir(root: &Path) -> io::Result<Vec<Entry>> {
     let raws = read_dir_bulk(root)?;
@@ -220,4 +242,19 @@ fn parse_entry(e: &[u8]) -> Option<Raw> {
         kind,
         alloc,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scan_threads_is_capped() {
+        assert_eq!(scan_threads(1), 1);
+        assert_eq!(scan_threads(8), 8);
+        assert_eq!(scan_threads(16), 16);
+        assert_eq!(scan_threads(24), MAX_SCAN_THREADS);
+        assert_eq!(scan_threads(128), MAX_SCAN_THREADS);
+        assert_eq!(scan_threads(0), 1);
+    }
 }
