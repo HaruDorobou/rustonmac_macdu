@@ -33,6 +33,8 @@ mac-du ~/Downloads   # 지정한 폴더
 | `r` | 지금 폴더 아래를 다시 스캔 |
 | `w` | 감시 켜기/끄기 (`+` `-`로 간격 조절) |
 | `p` | 위쪽 폴더까지 미리 스캔 |
+| `y` | 하이라이트된 항목의 전체 경로를 클립보드에 복사 |
+| `Y` | 지금 보고 있는 폴더의 경로를 클립보드에 복사 |
 | `e` | 읽지 못한 경로 목록 |
 | `q` `Esc` | 종료 |
 
@@ -64,8 +66,8 @@ cargo test
 cargo build --release
 ```
 
-`src/`는 `main.rs`(진입점), `cli.rs`(옵션), `scanner.rs`(스캔), `app.rs`(상태와 폴더 이동), `ui.rs`(화면)로 나뉩니다.
+`src/`는 `main.rs`(진입점), `cli.rs`(옵션), `scanner.rs`(스캔), `app.rs`(상태와 폴더 이동), `ui.rs`(화면), `clipboard.rs`(`pbcopy` 호출)로 나뉩니다.
 
 ## 라이선스
 
-Apache License 2.0. [LICENSE](LICENSE)를 보세요.
+Apache License 2.0. [LICENSE](LICENSE)

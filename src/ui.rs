@@ -237,18 +237,19 @@ fn draw_list(f: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
-    // 푸터: 오류 메시지가 있으면 그것을, 없으면 키 도움말
-    let footer = match &app.status {
-        Some(msg) => Paragraph::new(format!(" ⚠ {}", msg)).style(Style::default().fg(Color::Red)),
-        None => {
-            let watch_hint = if app.watch.is_some() { " (+/-: 간격)" } else { "" };
-            let errors_hint = if app.unreadable_here() > 0 { "   e: 오류 목록" } else { "" };
-            Paragraph::new(format!(
-                " j/k: 이동   l/Enter: 들어가기   h/Backspace: 상위   r: 다시 스캔   p: 위쪽 미리 스캔   w: 감시{}{}   q/Esc: 종료",
-                watch_hint, errors_hint
-            ))
-            .style(Style::default().fg(Color::DarkGray))
-        }
+    // 푸터: 오류 메시지 > 잠깐 보여 주는 알림 > 키 도움말 순서로 보여 준다
+    let footer = if let Some(msg) = &app.status {
+        Paragraph::new(format!(" ⚠ {}", msg)).style(Style::default().fg(Color::Red))
+    } else if let Some(msg) = app.notice() {
+        Paragraph::new(format!(" ✓ {}", msg)).style(Style::default().fg(Color::Green))
+    } else {
+        let watch_hint = if app.watch.is_some() { "  +/- 간격" } else { "" };
+        let errors_hint = if app.unreadable_here() > 0 { "  e 오류" } else { "" };
+        Paragraph::new(format!(
+            " j/k 이동  l 들어가기  h 상위  r 다시 스캔  p 위쪽 스캔  w 감시{}  y/Y 경로 복사{}  q 종료",
+            watch_hint, errors_hint
+        ))
+        .style(Style::default().fg(Color::DarkGray))
     };
     f.render_widget(footer, area);
 }

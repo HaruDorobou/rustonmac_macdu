@@ -1,5 +1,6 @@
 mod app;
 mod cli;
+mod clipboard;
 mod scanner;
 mod ui;
 
@@ -116,6 +117,8 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> io::
                 }
                 match key.code {
                     KeyCode::Char('p') => app.open_expand(),
+                    KeyCode::Char('y') => app.copy_selected(),
+                    KeyCode::Char('Y') => app.copy_current(),
                     KeyCode::Char('e') => app.toggle_errors(),
                     KeyCode::Char('r') => app.rescan(),
                     KeyCode::Char('w') => app.toggle_watch(),

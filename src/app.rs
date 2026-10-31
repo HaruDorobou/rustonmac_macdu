@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 
 use ratatui::widgets::ListState;
 
+use crate::clipboard;
 use crate::scanner::{self, ErrorReport, Node, ScanError, ScanOutput};
 
 /// 감시 간격의 최솟값(초). 이보다 짧으면 스캔이 겹치거나 디스크를 계속 읽게 된다.
@@ -17,6 +18,8 @@ pub const DEFAULT_WATCH_SECS: u64 = 5;
 const WATCH_STEPS: [u64; 12] = [2, 3, 5, 10, 15, 30, 60, 120, 300, 600, 1800, 3600];
 /// 크기 변화 표시를 화면에 남겨 두는 시간
 const CHANGE_VISIBLE: Duration = Duration::from_secs(30);
+/// "복사됨" 같은 알림을 푸터에 남겨 두는 시간
+const NOTICE_VISIBLE: Duration = Duration::from_secs(3);
 
 /// 감시 간격을 한 단계 늘린다.
 pub fn step_up(secs: u64) -> u64 {
@@ -138,6 +141,10 @@ pub struct App {
     pub last_checked: Option<Instant>,
     /// 마지막으로 현재 폴더 합계가 달라진 시각과 증감(바이트)
     pub last_change: Option<(Instant, i64)>,
+    /// 오류가 아닌 짧은 알림 (복사됨 등). 일정 시간 뒤에는 보이지 않는다.
+    notice: Option<(String, Instant)>,
+    /// 텍스트를 클립보드에 넣는 함수. 테스트가 실제 클립보드를 덮어쓰지 않도록 바꿔 끼울 수 있다.
+    copier: Box<dyn FnMut(&str) -> io::Result<()>>,
     changes: Changes,
     rx: Option<Receiver<ScanDone>>,
 }
@@ -176,6 +183,8 @@ impl App {
             last_watch_secs: DEFAULT_WATCH_SECS,
             last_checked: None,
             last_change: None,
+            notice: None,
+            copier: Box::new(clipboard::copy),
             changes: Changes::default(),
             rx: None,
         };
@@ -428,6 +437,48 @@ impl App {
                 select: None,
             },
         );
+    }
+
+    // ---- 경로 복사 --------------------------------------------------------
+
+    /// 하이라이트된 항목의 전체 경로
+    pub fn selected_path(&self) -> Option<PathBuf> {
+        Some(self.current.join(self.selected_name()?))
+    }
+
+    /// 하이라이트된 항목의 전체 경로를 클립보드에 복사한다.
+    pub fn copy_selected(&mut self) {
+        match self.selected_path() {
+            Some(path) => self.copy_text(path.to_string_lossy().into_owned()),
+            None => self.status = Some("복사할 항목이 없습니다".into()),
+        }
+    }
+
+    /// 지금 보고 있는 폴더의 경로를 클립보드에 복사한다.
+    pub fn copy_current(&mut self) {
+        let text = self.current.to_string_lossy().into_owned();
+        self.copy_text(text);
+    }
+
+    fn copy_text(&mut self, text: String) {
+        match (self.copier)(&text) {
+            Ok(()) => {
+                self.status = None;
+                self.notice = Some((format!("복사됨: {text}"), Instant::now()));
+            }
+            Err(e) => {
+                self.notice = None;
+                self.status = Some(format!("클립보드에 복사하지 못했습니다: {e}"));
+            }
+        }
+    }
+
+    /// 푸터에 잠깐 보여 줄 알림. 시간이 지나면 `None`.
+    pub fn notice(&self) -> Option<&str> {
+        self.notice
+            .as_ref()
+            .filter(|(_, at)| at.elapsed() < NOTICE_VISIBLE)
+            .map(|(msg, _)| msg.as_str())
     }
 
     // ---- 오류 목록 --------------------------------------------------------
@@ -931,6 +982,75 @@ mod tests {
         assert!(app.scanning.is_none(), "going up is instant now");
         assert_eq!(app.current, root);
         assert_eq!(names(&app), ["z", "a"]);
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// 실제 클립보드를 건드리지 않도록 복사 함수를 기록용으로 바꾼 앱
+    fn app_with_recording_clipboard(
+        dir: &Path,
+    ) -> (App, std::rc::Rc<std::cell::RefCell<Vec<String>>>) {
+        let copied = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut app = App::new(dir.to_path_buf());
+        let sink = copied.clone();
+        app.copier = Box::new(move |text| {
+            sink.borrow_mut().push(text.to_string());
+            Ok(())
+        });
+        wait(&mut app);
+        (app, copied)
+    }
+
+    #[test]
+    fn y_copies_the_highlighted_path_and_capital_y_the_current_folder() {
+        let root = temp_root("copy");
+        // 공백과 한글이 든 이름도 그대로 복사되어야 한다
+        fs::write(root.join("내 큰 파일 (1).bin"), vec![1u8; 300_000]).unwrap();
+        fs::create_dir_all(root.join("sub dir")).unwrap();
+        fs::write(root.join("sub dir/inner.txt"), vec![1u8; 10_000]).unwrap();
+
+        let (mut app, copied) = app_with_recording_clipboard(&root);
+        assert_eq!(names(&app), ["내 큰 파일 (1).bin", "sub dir"]);
+        assert!(app.notice().is_none());
+
+        app.copy_selected(); // 첫 항목: 큰 파일
+        assert_eq!(copied.borrow()[0], root.join("내 큰 파일 (1).bin").to_string_lossy());
+        assert!(app.notice().unwrap().contains("복사됨"));
+        assert!(app.status.is_none());
+
+        app.copy_current();
+        assert_eq!(copied.borrow()[1], root.to_string_lossy());
+
+        // 폴더 안에서는 그 폴더 기준의 전체 경로가 복사된다
+        app.state.select(Some(1));
+        app.enter();
+        app.copy_current();
+        app.copy_selected();
+        assert_eq!(copied.borrow()[2], root.join("sub dir").to_string_lossy());
+        assert_eq!(copied.borrow()[3], root.join("sub dir/inner.txt").to_string_lossy());
+        assert_eq!(copied.borrow().len(), 4);
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn copying_with_nothing_highlighted_or_a_failing_clipboard_reports_an_error() {
+        let root = temp_root("copy-err");
+        fs::create_dir_all(root.join("empty")).unwrap();
+
+        let (mut app, copied) = app_with_recording_clipboard(&root);
+        app.enter(); // 빈 폴더
+        assert_eq!(app.current, root.join("empty"));
+        app.copy_selected();
+        assert!(app.status.is_some(), "nothing to copy should be reported");
+        assert!(copied.borrow().is_empty());
+
+        // 클립보드 호출이 실패하면 알림 대신 오류가 나온다
+        app.status = None;
+        app.copier = Box::new(|_| Err(io::Error::other("no clipboard")));
+        app.copy_current();
+        assert!(app.status.as_deref().unwrap().contains("복사하지 못했습니다"));
+        assert!(app.notice().is_none());
 
         fs::remove_dir_all(&root).unwrap();
     }
