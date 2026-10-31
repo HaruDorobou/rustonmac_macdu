@@ -2,6 +2,7 @@ mod app;
 mod cli;
 mod clipboard;
 mod finder;
+mod units;
 mod scanner;
 mod ui;
 
@@ -47,6 +48,9 @@ fn main() -> io::Result<()> {
         }
         None => App::new(start),
     };
+    if opts.si {
+        app.units = units::Units::new(units::Base::Decimal);
+    }
     if let Some(secs) = opts.watch {
         app.enable_watch(secs);
     }
@@ -120,6 +124,9 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> io::
                     KeyCode::Char('p') => app.open_expand(),
                     KeyCode::Char('y') => app.copy_selected(),
                     KeyCode::Char('Y') => app.copy_current(),
+                    KeyCode::Char('u') => app.cycle_unit(),
+                    KeyCode::Char('s') => app.toggle_base(),
+                    KeyCode::Char('i') => app.show_exact(),
                     KeyCode::Char('o') => app.reveal_selected(),
                     KeyCode::Char('O') => app.open_current(),
                     KeyCode::Char('e') => app.toggle_errors(),

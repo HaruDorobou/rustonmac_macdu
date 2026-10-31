@@ -24,6 +24,9 @@ mac-du - macOS 디스크 사용량 TUI
                          (2 이상, 상한 없음). 마지막 스캔에 걸린 시간의 2배보다 짧은
                          간격으로는 돌지 않습니다. 앱 안에서는 w 키로 켜고 끄고,
                          +/- 키로 간격을 바꿉니다.
+    --si                 크기를 1000 기준(KB, MB, GB. Finder와 같음)으로 표시합니다.
+                         기본은 1024 기준(KiB, MiB, GiB. du -h와 같음)입니다.
+                         앱 안에서는 s 키로 기준을, u 키로 단위(자동/K/M/G/T)를 바꿉니다.
     -h, --help           이 도움말을 출력하고 종료
 
 환경 변수:
@@ -40,6 +43,8 @@ pub struct Options {
     pub watch: Option<u64>,
     /// 미리 전부 스캔해 둘 루트 폴더. 없으면 현재 폴더만 스캔한다.
     pub root: Option<PathBuf>,
+    /// 크기를 1000 기준(Finder와 같음)으로 시작한다. 없으면 1024 기준.
+    pub si: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -55,6 +60,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Parsed, String> 
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "-h" | "--help" => return Ok(Parsed::Help),
+            "--si" => opts.si = true,
             "-j" | "--threads" => {
                 let value = args
                     .next()
@@ -202,6 +208,27 @@ mod tests {
         // 모르는 옵션은 여전히 오류
         assert!(parse_strs(&["-x"]).is_err());
         assert!(parse_strs(&["-"]).is_err());
+    }
+
+    #[test]
+    fn si_switches_the_starting_base_and_mixes_with_other_arguments() {
+        let want = Ok(Parsed::Run(Options {
+            si: true,
+            ..Options::default()
+        }));
+        assert_eq!(parse_strs(&["--si"]), want);
+        assert_eq!(
+            parse_strs(&["--si", "dir"]),
+            Ok(Parsed::Run(Options {
+                si: true,
+                path: Some(PathBuf::from("dir")),
+                ..Options::default()
+            }))
+        );
+        assert_eq!(parse_strs(&["dir", "--si"]), parse_strs(&["--si", "dir"]));
+        // 값을 받는 옵션이 아니다
+        assert!(parse_strs(&["--si=1"]).is_err());
+        assert!(!matches!(parse_strs(&[]), Ok(Parsed::Run(Options { si: true, .. }))));
     }
 
     #[test]

@@ -9,6 +9,7 @@ use ratatui::{
 };
 
 use crate::app::{App, Change};
+use crate::units::Units;
 
 const BAR_WIDTH: usize = 20;
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -104,7 +105,7 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
                 " {}   (합계: {}{}{})",
                 app.current.display(),
                 at_least,
-                human(app.total_size()),
+                app.units.format(app.total_size()),
                 took
             )));
             if app.unreadable_here() > 0 {
@@ -154,7 +155,7 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
             Some((at, delta)) => {
                 spans.push(Span::raw(" · 마지막 변화 "));
                 spans.push(Span::styled(
-                    delta_label(delta),
+                    delta_label(delta, app.units),
                     delta_style(delta, now - at < FRESH),
                 ));
                 spans.push(Span::styled(format!(" ({})", ago(now - at)), dim));
@@ -187,6 +188,15 @@ fn draw_list(f: &mut Frame, app: &mut App, area: Rect) {
     // 목록: [변화 표시] 용량 · 비율 · 막대 · 이름 · 읽지 못함 · 증감
     let total = app.total_size().max(1);
     let max = app.children().iter().map(|e| e.size).max().unwrap_or(1).max(1);
+    // 크기 열 너비는 이 폴더에서 가장 긴 값에 맞춘다 (고정 단위에서는 값마다 길이가 다르다)
+    let units = app.units;
+    let size_w = app
+        .children()
+        .iter()
+        .map(|e| units.format(e.size).chars().count())
+        .max()
+        .unwrap_or(0)
+        .max(10);
 
     let items: Vec<ListItem> = app
         .children()
@@ -211,7 +221,7 @@ fn draw_list(f: &mut Frame, app: &mut App, area: Rect) {
                     _ => Span::raw("  "),
                 },
                 Span::styled(
-                    format!("{:>10} ", human(e.size)),
+                    format!("{:>w$} ", units.format(e.size), w = size_w),
                     Style::default().fg(Color::Yellow),
                 ),
                 Span::styled(
@@ -230,7 +240,7 @@ fn draw_list(f: &mut Frame, app: &mut App, area: Rect) {
             }
             if let Some(c) = change {
                 spans.push(Span::styled(
-                    format!("  {}", change_label(&c)),
+                    format!("  {}", change_label(&c, units)),
                     delta_style(c.delta, fresh),
                 ));
             }
@@ -250,7 +260,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     let footer = if let Some(msg) = &app.status {
         Paragraph::new(format!(" ⚠ {}", msg)).style(Style::default().fg(Color::Red))
     } else if let Some(msg) = app.notice() {
-        Paragraph::new(format!(" ✓ {}", msg)).style(Style::default().fg(Color::Green))
+        Paragraph::new(format!(" {}", msg)).style(Style::default().fg(Color::Green))
     } else {
         let items = help_items(app.watch.is_some(), app.unreadable_here() > 0);
         Paragraph::new(help_line(&items, area.width as usize))
@@ -275,6 +285,9 @@ fn help_items(watching: bool, has_errors: bool) -> Vec<(u8, String)> {
     }
     items.push((4, "y/Y 복사".to_string()));
     items.push((4, "o/O Finder".to_string()));
+    items.push((5, "u 단위".to_string()));
+    items.push((5, "s 기준".to_string()));
+    items.push((5, "i 크기".to_string()));
     if has_errors {
         items.push((2, "e 오류".to_string()));
     }
@@ -391,17 +404,17 @@ fn delta_style(delta: i64, fresh: bool) -> Style {
     }
 }
 
-/// `▲ +12.0 MB` / `▼ -3.0 KB`
-fn delta_label(delta: i64) -> String {
+/// `▲ +12.0 MiB` / `▼ -3.0 KiB`. 크기와 같은 기준·단위로 보여 준다.
+fn delta_label(delta: i64, units: Units) -> String {
     let arrow = if delta >= 0 { "▲ +" } else { "▼ -" };
-    format!("{}{}", arrow, human(delta.unsigned_abs()))
+    format!("{}{}", arrow, units.format(delta.unsigned_abs()))
 }
 
-fn change_label(c: &Change) -> String {
+fn change_label(c: &Change, units: Units) -> String {
     if c.is_new {
-        format!("NEW {}", human(c.delta.unsigned_abs()))
+        format!("NEW {}", units.format(c.delta.unsigned_abs()))
     } else {
-        delta_label(c.delta)
+        delta_label(c.delta, units)
     }
 }
 
@@ -428,31 +441,27 @@ fn age_label(secs: u64) -> String {
     }
 }
 
-/// 바이트를 사람이 읽기 좋은 단위로 바꾼다.
-pub fn human(bytes: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
-    let mut size = bytes as f64;
-    let mut i = 0;
-    while size >= 1024.0 && i < UNITS.len() - 1 {
-        size /= 1024.0;
-        i += 1;
-    }
-    if i == 0 {
-        format!("{} B", bytes)
-    } else {
-        format!("{:.1} {}", size, UNITS[i])
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::units::{Base, Unit};
 
     #[test]
     fn delta_labels_show_direction_and_unit() {
-        assert_eq!(delta_label(2048), "▲ +2.0 KB");
-        assert_eq!(delta_label(-3 * 1024 * 1024), "▼ -3.0 MB");
-        assert_eq!(delta_label(0), "▲ +0 B");
+        let bin = Units::default();
+        assert_eq!(delta_label(2048, bin), "▲ +2.0 KiB");
+        assert_eq!(delta_label(-3 * 1024 * 1024, bin), "▼ -3.0 MiB");
+        assert_eq!(delta_label(0, bin), "▲ +0 B");
+
+        // 1000 기준과 고정 단위를 따라간다
+        let dec = Units::new(Base::Decimal);
+        assert_eq!(delta_label(2_000, dec), "▲ +2.0 KB");
+        let gib = Units {
+            base: Base::Binary,
+            unit: Unit::G,
+        };
+        assert_eq!(delta_label(5 * 1024 * 1024 * 1024, gib), "▲ +5.00 GiB");
+        assert_eq!(delta_label(-4096, gib), "▼ -<0.01 GiB");
     }
 
     #[test]
@@ -462,7 +471,8 @@ mod tests {
             is_new: true,
             at: Instant::now(),
         };
-        assert_eq!(change_label(&c), "NEW 5.0 KB");
+        assert_eq!(change_label(&c, Units::default()), "NEW 5.0 KiB");
+        assert_eq!(change_label(&c, Units::new(Base::Decimal)), "NEW 5.1 KB");
     }
 
     fn items() -> Vec<(u8, String)> {

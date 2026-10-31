@@ -10,6 +10,7 @@ use ratatui::widgets::ListState;
 use crate::clipboard;
 use crate::finder;
 use crate::scanner::{self, ErrorReport, Node, ScanError, ScanOutput};
+use crate::units::{self, Units};
 
 /// 감시 간격의 최솟값(초). 이보다 짧으면 스캔이 겹치거나 디스크를 계속 읽게 된다.
 pub const MIN_WATCH_SECS: u64 = 2;
@@ -144,7 +145,10 @@ pub struct App {
     pub last_checked: Option<Instant>,
     /// 마지막으로 현재 폴더 합계가 달라진 시각과 증감(바이트)
     pub last_change: Option<(Instant, i64)>,
+    /// 크기를 어떤 기준과 단위로 보여 줄지
+    pub units: Units,
     /// 오류가 아닌 짧은 알림 (복사됨 등). 일정 시간 뒤에는 보이지 않는다.
+    /// 완료한 동작이면 문구가 `✓`로 시작한다.
     notice: Option<(String, Instant)>,
     /// 텍스트를 클립보드에 넣는 함수. 테스트가 실제 클립보드를 덮어쓰지 않도록 바꿔 끼울 수 있다.
     copier: Box<dyn FnMut(&str) -> io::Result<()>>,
@@ -196,6 +200,7 @@ impl App {
             last_watch_secs: DEFAULT_WATCH_SECS,
             last_checked: None,
             last_change: None,
+            units: Units::default(),
             notice: None,
             copier: Box::new(clipboard::copy),
             opener: Box::new(finder::open),
@@ -455,6 +460,35 @@ impl App {
         );
     }
 
+    // ---- 크기 표시 --------------------------------------------------------
+
+    /// 단위를 자동 → K → M → G → T 순으로 바꾼다.
+    pub fn cycle_unit(&mut self) {
+        self.units.cycle_unit();
+    }
+
+    /// 1024 기준과 1000 기준(Finder와 같음)을 바꾼다.
+    pub fn toggle_base(&mut self) {
+        self.units.toggle_base();
+    }
+
+    /// 하이라이트된 항목의 정확한 바이트 수와, 두 기준으로 읽은 값을 푸터에 잠깐 보여 준다.
+    pub fn show_exact(&mut self) {
+        let Some(node) = self
+            .state
+            .selected()
+            .and_then(|i| self.current_node().children.get(i))
+        else {
+            self.status = Some("표시할 항목이 없습니다".into());
+            return;
+        };
+        // 읽지 못한 부분이 있으면 실제 크기는 이 값 이상이다 (헤더의 `≥`와 같은 뜻)
+        let at_least = if node.unreadable > 0 { "≥ " } else { "" };
+        let msg = format!("크기: {at_least}{}", units::exact(node.size));
+        self.status = None;
+        self.notice = Some((msg, Instant::now()));
+    }
+
     // ---- 경로 복사 --------------------------------------------------------
 
     /// 하이라이트된 항목의 전체 경로
@@ -480,7 +514,7 @@ impl App {
         match (self.copier)(&text) {
             Ok(()) => {
                 self.status = None;
-                self.notice = Some((format!("복사됨: {text}"), Instant::now()));
+                self.notice = Some((format!("✓ 복사됨: {text}"), Instant::now()));
             }
             Err(e) => {
                 self.notice = None;
@@ -508,13 +542,13 @@ impl App {
         // Finder는 `.`으로 시작하는 항목을 기본으로 보여 주지 않는다
         let hidden = self.selected_name().is_some_and(|n| n.starts_with('.'));
         let text = path.to_string_lossy().into_owned();
-        self.run_open(&["-R", &text], format!("Finder에서 보기: {text}"), hidden);
+        self.run_open(&["-R", &text], format!("✓ Finder에서 보기: {text}"), hidden);
     }
 
     /// 지금 보고 있는 폴더를 Finder에서 연다 (`open`).
     pub fn open_current(&mut self) {
         let text = self.current.to_string_lossy().into_owned();
-        self.run_open(&[&text], format!("Finder에서 열기: {text}"), false);
+        self.run_open(&[&text], format!("✓ Finder에서 열기: {text}"), false);
     }
 
     fn run_open(&mut self, args: &[&str], done: String, hidden: bool) {
@@ -1316,6 +1350,67 @@ mod tests {
         assert!(status.contains("Finder를 열지 못했습니다") && status.contains("does not exist"));
         assert!(app.notice().is_none());
 
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn u_and_s_change_the_unit_and_the_base_independently() {
+        use crate::units::{Base, Unit};
+        let root = temp_root("units");
+        fs::write(root.join("f"), vec![1u8; 5_000]).unwrap();
+        let mut app = App::new(root.clone());
+        wait(&mut app);
+
+        assert_eq!((app.units.base, app.units.unit), (Base::Binary, Unit::Auto));
+        for want in [Unit::K, Unit::M, Unit::G, Unit::T, Unit::Auto] {
+            app.cycle_unit();
+            assert_eq!(app.units.unit, want);
+        }
+        app.cycle_unit(); // K
+        app.toggle_base();
+        assert_eq!((app.units.base, app.units.unit), (Base::Decimal, Unit::K));
+        // 폴더를 옮겨도 표시 설정은 그대로다
+        app.back();
+        assert_eq!((app.units.base, app.units.unit), (Base::Decimal, Unit::K));
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn i_shows_the_exact_size_and_marks_folders_that_could_not_be_fully_read() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = temp_root("exact");
+        fs::write(root.join("big.bin"), vec![1u8; 300_000]).unwrap();
+        fs::create_dir_all(root.join("locked")).unwrap();
+        fs::write(root.join("locked/hidden"), vec![1u8; 10]).unwrap();
+        fs::set_permissions(root.join("locked"), fs::Permissions::from_mode(0o000)).unwrap();
+        let restricted = fs::read_dir(root.join("locked")).is_err();
+
+        let mut app = App::new(root.clone());
+        wait(&mut app);
+
+        // 정확한 바이트와 두 기준의 값이 나란히 나온다 (단위 설정과 무관하게)
+        app.cycle_unit(); // 고정 단위여도 i는 영향을 받지 않는다
+        app.state.select(Some(0));
+        let size = app.children()[0].size;
+        assert_eq!(&*app.children()[0].name, "big.bin");
+        app.show_exact();
+        assert_eq!(app.notice(), Some(format!("크기: {}", units::exact(size)).as_str()));
+        assert!(app.notice().unwrap().contains(" B ("), "{:?}", app.notice());
+
+        if restricted {
+            let idx = names(&app).iter().position(|n| n == "locked").unwrap();
+            app.state.select(Some(idx));
+            app.show_exact();
+            assert!(app.notice().unwrap().starts_with("크기: ≥ "), "{:?}", app.notice());
+        }
+
+        // 항목이 없으면 알린다
+        app.state.select(None);
+        app.show_exact();
+        assert_eq!(app.status.as_deref(), Some("표시할 항목이 없습니다"));
+
+        fs::set_permissions(root.join("locked"), fs::Permissions::from_mode(0o755)).unwrap();
         fs::remove_dir_all(&root).unwrap();
     }
 
