@@ -31,7 +31,24 @@ fn main() -> io::Result<()> {
 
     // App::new가 곧바로 스캔을 시작하므로, 그보다 먼저 스레드 풀을 설정해야 한다
     scanner::init_thread_pool(opts.threads);
-    let mut app = App::new(std::env::current_dir()?);
+    let start = std::env::current_dir()?;
+    let mut app = match opts.root {
+        // 경로 비교가 어긋나지 않도록 심볼릭 링크를 풀어 둘 다 실제 경로로 맞춘다
+        Some(root) => match root.canonicalize() {
+            Ok(root) if root.is_dir() => {
+                App::with_root(start.canonicalize().unwrap_or(start), root)
+            }
+            Ok(root) => {
+                eprintln!("mac-du: --root는 폴더여야 합니다: {}", root.display());
+                std::process::exit(2);
+            }
+            Err(e) => {
+                eprintln!("mac-du: --root 경로를 열 수 없습니다: {} ({e})", root.display());
+                std::process::exit(2);
+            }
+        },
+        None => App::new(start),
+    };
     if let Some(secs) = opts.watch {
         app.enable_watch(secs);
     }

@@ -40,8 +40,12 @@ pub fn step_down(secs: u64) -> u64 {
 
 /// 스캔이 끝나면 결과를 어디에 반영할지
 enum Target {
-    /// 트리 전체를 새로 만든다 (시작할 때, 또는 트리 루트보다 위로 올라갈 때)
-    NewRoot { select: Option<String> },
+    /// 트리 전체를 새로 만든다 (시작할 때, 또는 트리 루트보다 위로 올라갈 때).
+    /// `open`이 있으면 스캔이 끝난 뒤 그 폴더로 들어가 있는다 (`--root` 사용 시 시작 폴더).
+    NewRoot {
+        select: Option<String>,
+        open: Option<PathBuf>,
+    },
     /// 트리 안의 한 폴더만 다시 스캔해 끼워 넣는다
     Subtree,
 }
@@ -119,12 +123,20 @@ pub struct App {
 }
 
 impl App {
+    /// `current`를 루트로 스캔하고 거기서 시작한다.
     pub fn new(current: PathBuf) -> Self {
+        Self::with_root(current.clone(), current)
+    }
+
+    /// `root` 전체를 미리 스캔해 두고 `start`에서 시작한다. 그러면 `root` 아래에서는 어느
+    /// 폴더로 오가도 다시 스캔하지 않는다. `start`가 `root` 밖이면 `root`에서 시작한다.
+    pub fn with_root(start: PathBuf, root: PathBuf) -> Self {
+        let open = start.starts_with(&root).then_some(start);
         let mut app = Self {
-            tree_root: current.clone(),
+            tree_root: root.clone(),
             root: Node::empty(),
             stack: Vec::new(),
-            current: current.clone(),
+            current: root.clone(),
             state: ListState::default(),
             should_quit: false,
             status: None,
@@ -143,7 +155,7 @@ impl App {
             changes: Changes::default(),
             rx: None,
         };
-        app.start_scan(current, Target::NewRoot { select: None });
+        app.start_scan(root, Target::NewRoot { select: None, open });
         app
     }
 
@@ -233,7 +245,13 @@ impl App {
             .tree_root
             .file_name()
             .map(|n| n.to_string_lossy().into_owned());
-        self.start_scan(parent, Target::NewRoot { select: left_name });
+        self.start_scan(
+            parent,
+            Target::NewRoot {
+                select: left_name,
+                open: None,
+            },
+        );
     }
 
     /// 현재 폴더 하위만 다시 스캔해 트리에 끼워 넣는다. 권한을 허용해 준 뒤나 파일이
@@ -440,17 +458,28 @@ impl App {
         self.status = None;
 
         match done.target {
-            Target::NewRoot { select } => {
+            Target::NewRoot { select, open } => {
                 self.root = out.root;
                 self.errors = out.errors;
                 self.tree_root = done.dir.clone();
                 self.stack.clear();
                 self.current = done.dir;
-                let index = select
-                    .as_deref()
-                    .and_then(|name| self.children().iter().position(|c| &*c.name == name))
-                    .or(if self.children().is_empty() { None } else { Some(0) });
-                self.state.select(index);
+                match open {
+                    // 미리 스캔해 둔 트리 안의 시작 폴더로 내려간다
+                    Some(open) => {
+                        self.current = open;
+                        self.reindex(select);
+                    }
+                    None => {
+                        let index = select
+                            .as_deref()
+                            .and_then(|name| {
+                                self.children().iter().position(|c| &*c.name == name)
+                            })
+                            .or(if self.children().is_empty() { None } else { Some(0) });
+                        self.state.select(index);
+                    }
+                }
                 self.changes = Changes::default();
                 self.last_change = None;
                 self.error_view.clear();
@@ -702,6 +731,58 @@ mod tests {
         assert_eq!(&*app.children()[selected].name, "x"); // 떠나온 폴더가 선택됨
 
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn prescanning_a_root_lets_you_start_deep_and_go_up_without_scanning() {
+        let root = temp_root("prescan");
+        fs::create_dir_all(root.join("a/b")).unwrap();
+        fs::create_dir_all(root.join("z")).unwrap();
+        fs::write(root.join("a/b/f"), vec![1u8; 10_000]).unwrap();
+        fs::write(root.join("a/g"), vec![1u8; 1_000]).unwrap();
+        fs::write(root.join("z/big"), vec![1u8; 300_000]).unwrap();
+
+        let start = root.join("a/b");
+        let mut app = App::with_root(start.clone(), root.clone());
+        assert_eq!(app.scanning.as_deref(), Some(root.as_path()), "the whole root is scanned");
+        wait(&mut app);
+
+        // 화면은 시작 폴더에 있고, 선택은 첫 항목
+        assert_eq!(app.current, start);
+        assert_eq!(names(&app), ["f"]);
+        assert_eq!(app.state.selected(), Some(0));
+
+        // 시작 폴더보다 위로, 루트까지 올라가도 스캔하지 않고 형제 폴더(z)도 이미 알고 있다
+        app.back();
+        assert_eq!(app.current, root.join("a"));
+        app.back();
+        assert!(app.scanning.is_none(), "everything under the root is already cached");
+        assert_eq!(app.current, root);
+        assert_eq!(names(&app), ["z", "a"]);
+        assert_eq!(&*app.children()[app.state.selected().unwrap()].name, "a");
+
+        // 형제 폴더로 들어가는 것도 즉시
+        app.state.select(Some(0));
+        app.enter();
+        assert!(app.scanning.is_none());
+        assert_eq!(names(&app), ["big"]);
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_start_folder_outside_the_root_falls_back_to_the_root() {
+        let root = temp_root("outside");
+        let other = temp_root("outside-other");
+        fs::write(root.join("f"), vec![1u8; 1_000]).unwrap();
+
+        let mut app = App::with_root(other.clone(), root.clone());
+        wait(&mut app);
+        assert_eq!(app.current, root);
+        assert_eq!(names(&app), ["f"]);
+
+        fs::remove_dir_all(&root).unwrap();
+        fs::remove_dir_all(&other).unwrap();
     }
 
     #[test]
