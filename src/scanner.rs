@@ -26,16 +26,17 @@ fn scan_threads(cpus: usize) -> usize {
 }
 
 /// 스캔용 rayon 스레드 풀을 설정한다. 스캔을 시작하기 전에 한 번 호출해야 한다.
-/// 실험용으로 `RAYON_NUM_THREADS`가 지정돼 있으면 그 값을 존중한다.
-pub fn init_thread_pool() {
-    if std::env::var_os("RAYON_NUM_THREADS").is_some() {
-        return;
-    }
-    let cpus = std::thread::available_parallelism().map_or(4, |n| n.get());
+///
+/// 우선순위: 명시한 `threads`(`--threads`) > `RAYON_NUM_THREADS` > 기본값(`min(코어, 16)`).
+/// 명시한 값은 상한 없이 그대로 쓴다.
+pub fn init_thread_pool(threads: Option<usize>) {
+    let n = match threads {
+        Some(n) => n,
+        None if std::env::var_os("RAYON_NUM_THREADS").is_some() => return,
+        None => scan_threads(std::thread::available_parallelism().map_or(4, |n| n.get())),
+    };
     // 이미 전역 풀이 만들어져 있으면 실패하지만, 그대로 쓰면 되므로 무시한다
-    let _ = rayon::ThreadPoolBuilder::new()
-        .num_threads(scan_threads(cpus))
-        .build_global();
+    let _ = rayon::ThreadPoolBuilder::new().num_threads(n).build_global();
 }
 
 /// `root`의 직계 자식들을 병렬로 스캔해 용량 내림차순으로 반환한다.

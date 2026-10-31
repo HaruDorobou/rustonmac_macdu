@@ -1,4 +1,5 @@
 mod app;
+mod cli;
 mod scanner;
 mod ui;
 
@@ -15,8 +16,21 @@ use ratatui::{backend::CrosstermBackend, Terminal};
 use app::App;
 
 fn main() -> io::Result<()> {
+    // 옵션 오류는 터미널을 raw 모드로 바꾸기 전에 처리해야 메시지가 제대로 보인다
+    let opts = match cli::parse(std::env::args().skip(1)) {
+        Ok(cli::Parsed::Run(opts)) => opts,
+        Ok(cli::Parsed::Help) => {
+            print!("{}", cli::HELP);
+            return Ok(());
+        }
+        Err(msg) => {
+            eprintln!("mac-du: {msg}\n자세한 사용법: mac-du --help");
+            std::process::exit(2);
+        }
+    };
+
     // App::new가 곧바로 스캔을 시작하므로, 그보다 먼저 스레드 풀을 설정해야 한다
-    scanner::init_thread_pool();
+    scanner::init_thread_pool(opts.threads);
     let mut app = App::new(std::env::current_dir()?);
 
     enable_raw_mode()?;
