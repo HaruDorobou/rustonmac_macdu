@@ -33,6 +33,45 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     if app.show_errors {
         draw_errors(f, app);
     }
+    if app.show_expand {
+        draw_expand(f, app);
+    }
+}
+
+/// 어느 상위 폴더까지 미리 스캔해 둘지 고르는 팝업
+fn draw_expand(f: &mut Frame, app: &mut App) {
+    let area = centered(f.area(), 70, 50);
+    f.render_widget(Clear, area);
+
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    let items: Vec<ListItem> = app
+        .expand_candidates
+        .iter()
+        .map(|p| {
+            let note = if home.as_deref() == Some(p.as_path()) {
+                "  (홈)"
+            } else if p.parent().is_none() {
+                "  (디스크 전체)"
+            } else {
+                ""
+            };
+            ListItem::new(Line::from(vec![
+                Span::raw(p.display().to_string()),
+                Span::styled(note, Style::default().fg(Color::DarkGray)),
+            ]))
+        })
+        .collect();
+
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" 어디까지 미리 스캔할까요?  j/k 이동 · Enter 확인 · Esc 닫기 ")
+                .title_bottom(" 넓을수록 시간과 메모리가 더 듭니다. 이미 스캔한 부분은 다시 읽지 않습니다. "),
+        )
+        .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
+        .highlight_symbol("> ");
+    f.render_stateful_widget(list, area, &mut app.expand_state);
 }
 
 fn draw_header(f: &mut Frame, app: &App, area: Rect) {
@@ -66,10 +105,11 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
                 ));
             }
             if app.refreshing {
-                line1.push(Span::styled(
-                    format!("   {} 갱신 중…", spinner),
-                    Style::default().fg(Color::Cyan),
-                ));
+                let label = match (&app.scanning, app.expanding) {
+                    (Some(dir), true) => format!("   {} {} 까지 스캔 중…", spinner, dir.display()),
+                    _ => format!("   {} 갱신 중…", spinner),
+                };
+                line1.push(Span::styled(label, Style::default().fg(Color::Cyan)));
             }
         }
     }
@@ -204,7 +244,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             let watch_hint = if app.watch.is_some() { " (+/-: 간격)" } else { "" };
             let errors_hint = if app.unreadable_here() > 0 { "   e: 오류 목록" } else { "" };
             Paragraph::new(format!(
-                " j/k: 이동   l/Enter: 들어가기   h/Backspace: 상위   r: 다시 스캔   w: 감시{}{}   q/Esc: 종료",
+                " j/k: 이동   l/Enter: 들어가기   h/Backspace: 상위   r: 다시 스캔   p: 위쪽 미리 스캔   w: 감시{}{}   q/Esc: 종료",
                 watch_hint, errors_hint
             ))
             .style(Style::default().fg(Color::DarkGray))

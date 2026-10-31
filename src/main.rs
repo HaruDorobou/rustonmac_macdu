@@ -91,7 +91,20 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> io::
                     }
                     continue;
                 }
+                if app.show_expand {
+                    match key.code {
+                        KeyCode::Char('p') | KeyCode::Char('q') | KeyCode::Esc => {
+                            app.close_expand()
+                        }
+                        KeyCode::Up | KeyCode::Char('k') => app.expand_previous(),
+                        KeyCode::Down | KeyCode::Char('j') => app.expand_next(),
+                        KeyCode::Enter | KeyCode::Char('l') => app.confirm_expand(),
+                        _ => {}
+                    }
+                    continue;
+                }
                 match key.code {
+                    KeyCode::Char('p') => app.open_expand(),
                     KeyCode::Char('e') => app.toggle_errors(),
                     KeyCode::Char('r') => app.rescan(),
                     KeyCode::Char('w') => app.toggle_watch(),

@@ -38,6 +38,15 @@ impl Node {
         }
     }
 
+    /// `path`(루트 아래 폴더 이름들)가 가리키는 폴더 노드. 없으면 `None`.
+    pub fn find(&self, path: &[String]) -> Option<&Node> {
+        let mut node = self;
+        for name in path {
+            node = node.children.iter().find(|c| c.is_dir && *c.name == **name)?;
+        }
+        Some(node)
+    }
+
     /// `path`(루트 아래 폴더 이름들)가 가리키는 폴더의 내용을 `new`로 바꾸고,
     /// 지나온 상위 폴더들의 크기와 정렬을 다시 계산한다. 경로가 없으면 `false`.
     pub fn replace_at(&mut self, path: &[String], new: Node) -> bool {
@@ -91,6 +100,13 @@ impl ErrorReport {
         let room = MAX_REPORTED.saturating_sub(self.list.len());
         self.list.extend(fresh.list.into_iter().take(room));
     }
+
+    /// 다른 기록을 이 기록에 합친다.
+    pub fn absorb(&mut self, other: ErrorReport) {
+        self.total += other.total;
+        let room = MAX_REPORTED.saturating_sub(self.list.len());
+        self.list.extend(other.list.into_iter().take(room));
+    }
 }
 
 pub struct ScanOutput {
@@ -142,10 +158,17 @@ pub fn init_thread_pool(threads: Option<usize>) {
 
 /// `root` 아래 전체를 병렬로 스캔해 트리로 반환한다. 각 폴더의 자식은 크기 내림차순이다.
 /// `root` 자체를 열 수 없으면 `Err`. 그 아래에서 읽지 못한 경로는 `errors`에 모은다.
+#[cfg(test)]
 pub fn scan_tree(root: &Path) -> io::Result<ScanOutput> {
+    scan_tree_skipping(root, None)
+}
+
+/// `scan_tree`와 같지만 `skip` 폴더는 읽지 않고 비어 있는 자리표시 노드로 남긴다.
+/// 이미 스캔해 둔 하위 트리를 `Node::replace_at`으로 끼워 넣을 때 쓴다.
+pub fn scan_tree_skipping(root: &Path, skip: Option<&Path>) -> io::Result<ScanOutput> {
     let log = ErrorLog::default();
     let raws = read_dir_bulk(root, &log)?;
-    let root = build_dir_node("".into(), root, raws, &log);
+    let root = build_dir_node("".into(), root, raws, &log, skip);
     Ok(ScanOutput {
         root,
         errors: log.into_report(),
@@ -153,9 +176,9 @@ pub fn scan_tree(root: &Path) -> io::Result<ScanOutput> {
 }
 
 /// 폴더를 열어서 노드로 만든다. 열지 못하면 오류를 기록하고 비어 있는 노드를 돌려준다.
-fn scan_dir_node(name: Box<str>, path: &Path, log: &ErrorLog) -> Node {
+fn scan_dir_node(name: Box<str>, path: &Path, log: &ErrorLog, skip: Option<&Path>) -> Node {
     match read_dir_bulk(path, log) {
-        Ok(raws) => build_dir_node(name, path, raws, log),
+        Ok(raws) => build_dir_node(name, path, raws, log, skip),
         Err(e) => {
             log.push(path.to_path_buf(), e.raw_os_error().unwrap_or(0));
             Node {
@@ -171,7 +194,13 @@ fn scan_dir_node(name: Box<str>, path: &Path, log: &ErrorLog) -> Node {
 
 /// 이미 읽은 항목 목록으로 폴더 노드를 만든다. 하위 폴더는 병렬로 재귀한다.
 /// 심볼릭 링크는 따라가지 않는다 (순환 방지).
-fn build_dir_node(name: Box<str>, path: &Path, raws: Vec<Raw>, log: &ErrorLog) -> Node {
+fn build_dir_node(
+    name: Box<str>,
+    path: &Path,
+    raws: Vec<Raw>,
+    log: &ErrorLog,
+    skip: Option<&Path>,
+) -> Node {
     // 파일은 값싸게 바로 처리하고, 하위 폴더만 병렬로 재귀한다
     let (dirs, others): (Vec<Raw>, Vec<Raw>) = raws
         .into_iter()
@@ -190,7 +219,18 @@ fn build_dir_node(name: Box<str>, path: &Path, raws: Vec<Raw>, log: &ErrorLog) -
 
     children.par_extend(dirs.into_par_iter().map(|r| {
         let child_path = path.join(&r.name);
-        scan_dir_node(r.name.into_boxed_str(), &child_path, log)
+        let name = r.name.into_boxed_str();
+        if skip == Some(child_path.as_path()) {
+            // 이미 스캔해 둔 폴더. 읽지 않고 자리만 잡아 두면 나중에 끼워 넣는다.
+            return Node {
+                name,
+                is_dir: true,
+                size: 0,
+                unreadable: 0,
+                children: Box::new([]),
+            };
+        }
+        scan_dir_node(name, &child_path, log, skip)
     }));
 
     children.sort_unstable_by(|a, b| b.size.cmp(&a.size));
@@ -483,6 +523,38 @@ mod tests {
         assert_eq!(tree.size, a.size + child(&tree, "c").size);
         // 없는 경로는 실패하고 트리를 바꾸지 않는다
         assert!(!tree.replace_at(&["nope".to_string()], Node::empty()));
+    }
+
+    #[test]
+    fn skipping_a_subtree_leaves_a_placeholder_that_can_be_filled_in_later() {
+        let root = temp_root("skip");
+        fs::create_dir_all(root.join("known/deep")).unwrap();
+        fs::create_dir_all(root.join("other")).unwrap();
+        fs::write(root.join("known/deep/f"), vec![1u8; 80_000]).unwrap();
+        fs::write(root.join("other/f"), vec![1u8; 30_000]).unwrap();
+        fs::write(root.join("top"), vec![1u8; 5_000]).unwrap();
+
+        let full = scan_tree(&root).unwrap();
+        let known = scan_tree(&root.join("known")).unwrap();
+        let mut partial = scan_tree_skipping(&root, Some(&root.join("known"))).unwrap();
+        fs::remove_dir_all(&root).unwrap();
+
+        // 건너뛴 폴더는 비어 있는 자리표시만 남는다
+        let placeholder = child(&partial.root, "known");
+        assert_eq!(placeholder.size, 0);
+        assert!(placeholder.children.is_empty());
+        assert!(partial.root.size < full.root.size);
+
+        // 미리 스캔해 둔 하위 트리를 끼워 넣으면 전체를 한 번에 스캔한 것과 같아진다
+        assert!(partial.root.replace_at(&["known".to_string()], known.root));
+        assert_eq!(partial.root.size, full.root.size);
+        let names = |n: &Node| n.children.iter().map(|c| c.name.to_string()).collect::<Vec<_>>();
+        assert_eq!(names(&partial.root), names(&full.root));
+        assert_eq!(
+            partial.root.find(&["known".into(), "deep".into()]).unwrap().size,
+            full.root.find(&["known".into(), "deep".into()]).unwrap().size
+        );
+        assert!(partial.root.find(&["nope".into()]).is_none());
     }
 
     #[test]

@@ -38,6 +38,11 @@ pub fn step_down(secs: u64) -> u64 {
         .max(MIN_WATCH_SECS)
 }
 
+/// `root`의 상위 폴더들을 가까운 순으로 돌려준다 (`/`까지). `/`이면 비어 있다.
+fn expand_candidates_for(root: &Path) -> Vec<PathBuf> {
+    root.ancestors().skip(1).map(Path::to_path_buf).collect()
+}
+
 /// 스캔이 끝나면 결과를 어디에 반영할지
 enum Target {
     /// 트리 전체를 새로 만든다 (시작할 때, 또는 트리 루트보다 위로 올라갈 때).
@@ -48,6 +53,14 @@ enum Target {
     },
     /// 트리 안의 한 폴더만 다시 스캔해 끼워 넣는다
     Subtree,
+    /// 트리 루트보다 위의 폴더(`ScanDone::dir`)까지 범위를 넓힌다. 이미 스캔한 기존 트리는
+    /// 읽지 않고 그대로 끼워 넣으므로 위쪽 나머지 부분만 새로 읽는다.
+    /// 끝나면 `open`이 있을 때만 그 폴더로 이동하고(`h`로 올라가는 경우), 없으면 사용자가
+    /// 그 사이 옮겨 간 위치를 그대로 둔다. `select`가 없으면 보던 항목을 유지한다.
+    Expand {
+        open: Option<PathBuf>,
+        select: Option<String>,
+    },
 }
 
 /// 백그라운드 스캔이 끝났을 때 UI 스레드로 보내는 결과
@@ -99,6 +112,13 @@ pub struct App {
     /// 진행 중인 스캔이 기존 화면을 유지한 채 하는 갱신(`r`, 감시)인지.
     /// 시작/상위 이동처럼 보여 줄 데이터가 없는 스캔이면 `false`.
     pub refreshing: bool,
+    /// 진행 중인 스캔이 상위 폴더로 범위를 넓히는 것인지 (`refreshing`의 한 종류)
+    pub expanding: bool,
+    /// 상위 폴더 미리 스캔 팝업이 열려 있는지
+    pub show_expand: bool,
+    /// 팝업에 보여 줄 후보: 트리 루트의 상위 폴더들 (가까운 순)
+    pub expand_candidates: Vec<PathBuf>,
+    pub expand_state: ListState,
     /// 스피너 애니메이션용 프레임 카운터
     pub tick: usize,
     /// 가장 최근에 끝난 스캔의 소요 시간
@@ -142,6 +162,10 @@ impl App {
             status: None,
             scanning: None,
             refreshing: false,
+            expanding: false,
+            show_expand: false,
+            expand_candidates: Vec::new(),
+            expand_state: ListState::default(),
             tick: 0,
             last_scan: None,
             errors: ErrorReport::default(),
@@ -245,11 +269,12 @@ impl App {
             .tree_root
             .file_name()
             .map(|n| n.to_string_lossy().into_owned());
+        // 이미 스캔한 트리는 버리지 않고 부모의 나머지(형제 폴더들)만 새로 읽는다
         self.start_scan(
-            parent,
-            Target::NewRoot {
+            parent.clone(),
+            Target::Expand {
+                open: Some(parent),
                 select: left_name,
-                open: None,
             },
         );
     }
@@ -337,6 +362,74 @@ impl App {
             .filter(|c| c.at.elapsed() < CHANGE_VISIBLE)
     }
 
+    // ---- 상위 폴더 미리 스캔 ----------------------------------------------
+
+    /// 상위 폴더 중 하나를 골라 그 폴더까지 미리 스캔해 두는 팝업을 연다.
+    /// 홈 디렉토리가 후보에 있으면 그것을 먼저 선택해 둔다.
+    pub fn open_expand(&mut self) {
+        if self.scanning.is_some() {
+            return;
+        }
+        let candidates = expand_candidates_for(&self.tree_root);
+        if candidates.is_empty() {
+            self.status = Some("이미 최상위 폴더(/)까지 스캔했습니다".into());
+            return;
+        }
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let preferred = home
+            .and_then(|h| candidates.iter().position(|c| *c == h))
+            .unwrap_or(0);
+        self.expand_candidates = candidates;
+        self.expand_state.select(Some(preferred));
+        self.show_expand = true;
+        self.show_errors = false;
+    }
+
+    pub fn close_expand(&mut self) {
+        self.show_expand = false;
+    }
+
+    pub fn expand_next(&mut self) {
+        if self.expand_candidates.is_empty() {
+            return;
+        }
+        let last = self.expand_candidates.len() - 1;
+        let i = self.expand_state.selected().map_or(0, |i| (i + 1).min(last));
+        self.expand_state.select(Some(i));
+    }
+
+    pub fn expand_previous(&mut self) {
+        if self.expand_candidates.is_empty() {
+            return;
+        }
+        let i = self.expand_state.selected().map_or(0, |i| i.saturating_sub(1));
+        self.expand_state.select(Some(i));
+    }
+
+    /// 고른 상위 폴더까지 스캔을 시작한다. 보고 있는 화면은 그대로 두고, 끝나면
+    /// 새 트리로 바꾼다. 이미 스캔한 부분은 다시 읽지 않는다.
+    pub fn confirm_expand(&mut self) {
+        let Some(dir) = self
+            .expand_state
+            .selected()
+            .and_then(|i| self.expand_candidates.get(i))
+            .cloned()
+        else {
+            return;
+        };
+        self.show_expand = false;
+        if self.scanning.is_some() {
+            return;
+        }
+        self.start_scan(
+            dir,
+            Target::Expand {
+                open: None,
+                select: None,
+            },
+        );
+    }
+
     // ---- 오류 목록 --------------------------------------------------------
 
     /// 오류 목록 팝업을 열고 닫는다. 현재 폴더 하위에 읽지 못한 경로가 없으면 열지 않는다.
@@ -410,6 +503,7 @@ impl App {
                 // 스캔 스레드가 결과 없이 종료됨 (패닉 등)
                 self.scanning = None;
                 self.refreshing = false;
+                self.expanding = false;
                 self.rx = None;
                 self.status = Some("스캔이 중단되었습니다".into());
                 self.schedule_next();
@@ -422,11 +516,15 @@ impl App {
         let (tx, rx) = mpsc::channel();
         self.rx = Some(rx);
         self.scanning = Some(dir.clone());
-        self.refreshing = matches!(target, Target::Subtree);
+        // 기존 화면이 있는 채로 하는 스캔이면 화면을 유지한다 (시작/--root 스캔만 제외)
+        self.refreshing = !matches!(target, Target::NewRoot { .. });
+        self.expanding = matches!(target, Target::Expand { .. });
+        // 범위를 넓힐 때는 이미 스캔한 현재 트리를 다시 읽지 않도록 건너뛴다
+        let skip = self.expanding.then(|| self.tree_root.clone());
 
         thread::spawn(move || {
             let started = Instant::now();
-            let result = scanner::scan_tree(&dir);
+            let result = scanner::scan_tree_skipping(&dir, skip.as_deref());
             let elapsed = started.elapsed();
             // 수신 쪽이 이미 종료됐다면 보낼 곳이 없을 뿐이므로 무시한다
             let _ = tx.send(ScanDone {
@@ -441,6 +539,7 @@ impl App {
     fn finish_scan(&mut self, done: ScanDone) {
         self.scanning = None;
         self.refreshing = false;
+        self.expanding = false;
         self.rx = None;
         self.apply_scan(done);
         self.schedule_next();
@@ -484,6 +583,35 @@ impl App {
                 self.last_change = None;
                 self.error_view.clear();
                 self.show_errors = false;
+            }
+            Target::Expand { open, select } => {
+                // 기존 트리가 새 트리의 어디에 들어가는지 (새 루트 → 기존 루트까지의 폴더 이름들)
+                let Ok(rel) = self.tree_root.strip_prefix(&done.dir) else {
+                    return;
+                };
+                let names: Vec<String> = rel
+                    .components()
+                    .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                    .collect();
+                // 자리표시 노드가 없으면(스캔하는 사이 폴더가 사라졌다면) 기존 트리를 지키기 위해 중단
+                if out.root.find(&names).is_none() {
+                    self.status = Some("폴더 구조가 바뀌어 범위를 넓히지 못했습니다".into());
+                    return;
+                }
+                let selected = select.or_else(|| self.selected_name());
+                let old_root = std::mem::replace(&mut self.root, out.root);
+                let grafted = self.root.replace_at(&names, old_root);
+                debug_assert!(grafted, "placeholder existence was checked above");
+
+                let mut errors = out.errors;
+                errors.absorb(std::mem::take(&mut self.errors));
+                self.errors = errors;
+                self.tree_root = done.dir.clone();
+                if let Some(open) = open {
+                    self.current = open;
+                }
+                self.reindex(selected);
+                self.refresh_error_view();
             }
             Target::Subtree => {
                 let Some(names) = self.names_under_root(&done.dir) else {
@@ -720,9 +848,10 @@ mod tests {
 
         let mut app = App::new(root.join("x"));
         wait(&mut app);
-        app.back(); // 트리 루트(x)보다 위 → 부모를 새로 스캔
+        app.back(); // 트리 루트(x)보다 위 → 부모까지 범위를 넓힌다
         assert!(app.scanning.is_some());
-        assert!(!app.refreshing, "a new-root scan has no old data to keep");
+        assert!(app.refreshing && app.expanding, "the old screen stays while expanding");
+        assert_eq!(app.current, root.join("x"), "still showing x until the scan is done");
         wait(&mut app);
 
         assert_eq!(app.current, root);
@@ -731,6 +860,94 @@ mod tests {
         assert_eq!(&*app.children()[selected].name, "x"); // 떠나온 폴더가 선택됨
 
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn expanding_reuses_the_subtree_it_already_has() {
+        let root = temp_root("reuse");
+        fs::create_dir_all(root.join("x")).unwrap();
+        fs::create_dir_all(root.join("y")).unwrap();
+        fs::write(root.join("x/f"), vec![1u8; 10_000]).unwrap();
+        fs::write(root.join("y/f"), vec![1u8; 100_000]).unwrap();
+
+        let mut app = App::new(root.join("x"));
+        wait(&mut app);
+        let x_before = app.total_size();
+
+        // 스캔 뒤에 x가 바뀌었다. 위로 올라가며 x를 다시 읽는다면 이 변화가 보일 것이다.
+        fs::write(root.join("x/huge"), vec![1u8; 900_000]).unwrap();
+        app.back();
+        wait(&mut app);
+
+        assert_eq!(app.current, root);
+        let x = app.children().iter().find(|c| &*c.name == "x").unwrap();
+        assert_eq!(x.size, x_before, "x must come from the tree we already had");
+
+        // 합계는 새로 읽은 y와 재사용한 x가 맞게 합쳐져야 한다
+        let sum: u64 = app.children().iter().map(|c| c.size).sum();
+        assert_eq!(app.total_size(), sum);
+
+        // r로 갱신하면 그제야 x의 변화가 반영된다
+        app.state.select(Some(app.children().iter().position(|c| &*c.name == "x").unwrap()));
+        app.enter();
+        app.rescan();
+        wait(&mut app);
+        assert!(names(&app).contains(&"huge".to_string()));
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn the_expand_popup_widens_the_cache_without_moving_the_view() {
+        let root = temp_root("popup");
+        fs::create_dir_all(root.join("a/b")).unwrap();
+        fs::create_dir_all(root.join("z")).unwrap();
+        fs::write(root.join("a/b/f"), vec![1u8; 10_000]).unwrap();
+        fs::write(root.join("z/big"), vec![1u8; 300_000]).unwrap();
+
+        let start = root.join("a/b");
+        let mut app = App::new(start.clone());
+        wait(&mut app);
+
+        app.open_expand();
+        assert!(app.show_expand);
+        // 후보는 시작 폴더의 상위 폴더들이고 가까운 순이다
+        assert_eq!(app.expand_candidates[0], root.join("a"));
+        assert_eq!(app.expand_candidates[1], root);
+
+        let pos = app.expand_candidates.iter().position(|c| *c == root).unwrap();
+        app.expand_state.select(Some(pos));
+        app.confirm_expand();
+        assert!(!app.show_expand);
+        assert!(app.expanding && app.refreshing);
+        assert_eq!(app.current, start, "the view stays put while scanning");
+        wait(&mut app);
+
+        // 화면 위치는 그대로, 하지만 이제 위쪽과 형제 폴더가 전부 캐시에 있다
+        assert_eq!(app.current, start);
+        assert_eq!(names(&app), ["f"]);
+        app.back();
+        app.back();
+        assert!(app.scanning.is_none(), "going up is instant now");
+        assert_eq!(app.current, root);
+        assert_eq!(names(&app), ["z", "a"]);
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn expand_candidates_run_from_the_parent_up_to_the_filesystem_root() {
+        let got = expand_candidates_for(Path::new("/Users/me/work"));
+        assert_eq!(
+            got,
+            [
+                PathBuf::from("/Users/me"),
+                PathBuf::from("/Users"),
+                PathBuf::from("/")
+            ]
+        );
+        // 이미 최상위면 넓힐 곳이 없다 (디스크 전체를 스캔하지 않고 순수 함수로 확인한다)
+        assert!(expand_candidates_for(Path::new("/")).is_empty());
     }
 
     #[test]
