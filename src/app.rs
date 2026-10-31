@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -7,6 +8,35 @@ use std::time::{Duration, Instant};
 use ratatui::widgets::ListState;
 
 use crate::scanner::{self, ErrorReport, Node, ScanError, ScanOutput};
+
+/// 감시 간격의 최솟값(초). 이보다 짧으면 스캔이 겹치거나 디스크를 계속 읽게 된다.
+pub const MIN_WATCH_SECS: u64 = 2;
+/// `w`로 처음 켤 때의 감시 간격(초)
+pub const DEFAULT_WATCH_SECS: u64 = 5;
+/// `+`/`-` 키로 오르내리는 간격 단계(초). 마지막 단계를 넘으면 두 배씩 늘어난다(상한 없음).
+const WATCH_STEPS: [u64; 12] = [2, 3, 5, 10, 15, 30, 60, 120, 300, 600, 1800, 3600];
+/// 크기 변화 표시를 화면에 남겨 두는 시간
+const CHANGE_VISIBLE: Duration = Duration::from_secs(30);
+
+/// 감시 간격을 한 단계 늘린다.
+pub fn step_up(secs: u64) -> u64 {
+    WATCH_STEPS
+        .iter()
+        .copied()
+        .find(|&s| s > secs)
+        .unwrap_or(secs.saturating_mul(2))
+}
+
+/// 감시 간격을 한 단계 줄인다. `MIN_WATCH_SECS` 아래로는 내려가지 않는다.
+pub fn step_down(secs: u64) -> u64 {
+    WATCH_STEPS
+        .iter()
+        .rev()
+        .copied()
+        .find(|&s| s < secs)
+        .unwrap_or(MIN_WATCH_SECS)
+        .max(MIN_WATCH_SECS)
+}
 
 /// 스캔이 끝나면 결과를 어디에 반영할지
 enum Target {
@@ -25,6 +55,29 @@ struct ScanDone {
     elapsed: Duration,
 }
 
+/// 감시 모드: 일정 간격으로 현재 폴더를 다시 스캔한다.
+pub struct Watch {
+    /// 사용자가 정한 간격(초)
+    pub secs: u64,
+    next_at: Instant,
+}
+
+/// 직전 스캔과 비교한 항목 하나의 크기 변화
+#[derive(Debug, Clone, Copy)]
+pub struct Change {
+    /// 바이트 단위 증감 (새 항목이면 그 크기)
+    pub delta: i64,
+    pub is_new: bool,
+    pub at: Instant,
+}
+
+#[derive(Default)]
+struct Changes {
+    /// 이 변화들이 속한 폴더. 다른 폴더를 보고 있을 때는 표시하지 않는다.
+    dir: PathBuf,
+    map: HashMap<String, Change>,
+}
+
 pub struct App {
     /// 스캔해 둔 트리의 루트 폴더 (시작한 폴더, 또는 거기서 위로 올라간 폴더)
     tree_root: PathBuf,
@@ -39,9 +92,12 @@ pub struct App {
     pub status: Option<String>,
     /// 백그라운드 스캔 진행 중이면 스캔 대상 디렉토리
     pub scanning: Option<PathBuf>,
+    /// 진행 중인 스캔이 기존 화면을 유지한 채 하는 갱신(`r`, 감시)인지.
+    /// 시작/상위 이동처럼 보여 줄 데이터가 없는 스캔이면 `false`.
+    pub refreshing: bool,
     /// 스피너 애니메이션용 프레임 카운터
     pub tick: usize,
-    /// 트리를 만든(또는 마지막으로 갱신한) 스캔의 소요 시간
+    /// 가장 최근에 끝난 스캔의 소요 시간
     pub last_scan: Option<Duration>,
     /// 트리 전체에서 읽지 못한 경로들
     errors: ErrorReport,
@@ -50,6 +106,15 @@ pub struct App {
     /// 오류 목록 팝업이 열려 있는지
     pub show_errors: bool,
     pub error_state: ListState,
+
+    pub watch: Option<Watch>,
+    /// 감시를 껐다 켜도 마지막에 쓴 간격을 기억한다
+    last_watch_secs: u64,
+    /// 마지막으로 스캔 결과를 확인한 시각 (변화가 없어도 갱신된다)
+    pub last_checked: Option<Instant>,
+    /// 마지막으로 현재 폴더 합계가 달라진 시각과 증감(바이트)
+    pub last_change: Option<(Instant, i64)>,
+    changes: Changes,
     rx: Option<Receiver<ScanDone>>,
 }
 
@@ -64,12 +129,18 @@ impl App {
             should_quit: false,
             status: None,
             scanning: None,
+            refreshing: false,
             tick: 0,
             last_scan: None,
             errors: ErrorReport::default(),
             error_view: Vec::new(),
             show_errors: false,
             error_state: ListState::default(),
+            watch: None,
+            last_watch_secs: DEFAULT_WATCH_SECS,
+            last_checked: None,
+            last_change: None,
+            changes: Changes::default(),
             rx: None,
         };
         app.start_scan(current, Target::NewRoot { select: None });
@@ -165,8 +236,8 @@ impl App {
         self.start_scan(parent, Target::NewRoot { select: left_name });
     }
 
-    /// 현재 폴더 하위만 다시 스캔해 트리에 끼워 넣는다. 권한을 허용해 준 뒤 결과를
-    /// 갱신할 때 쓴다. 이미 스캔 중이면 무시한다.
+    /// 현재 폴더 하위만 다시 스캔해 트리에 끼워 넣는다. 권한을 허용해 준 뒤나 파일이
+    /// 바뀐 뒤 결과를 갱신할 때 쓴다. 이미 스캔 중이면 무시한다.
     pub fn rescan(&mut self) {
         if self.scanning.is_some() {
             return;
@@ -174,19 +245,89 @@ impl App {
         self.start_scan(self.current.clone(), Target::Subtree);
     }
 
+    // ---- 감시(watch) ------------------------------------------------------
+
+    /// 감시 모드를 `secs`초 간격으로 켠다. 최솟값 미만이면 최솟값으로 올린다.
+    pub fn enable_watch(&mut self, secs: u64) {
+        let secs = secs.max(MIN_WATCH_SECS);
+        self.last_watch_secs = secs;
+        self.watch = Some(Watch {
+            secs,
+            next_at: Instant::now(),
+        });
+        self.schedule_next();
+    }
+
+    pub fn toggle_watch(&mut self) {
+        if self.watch.is_some() {
+            self.watch = None;
+        } else {
+            self.enable_watch(self.last_watch_secs);
+        }
+    }
+
+    /// 감시 간격을 한 단계 늘리거나(`true`) 줄인다. 감시가 꺼져 있으면 무시한다.
+    pub fn adjust_watch(&mut self, longer: bool) {
+        let Some(w) = &self.watch else { return };
+        let secs = if longer {
+            step_up(w.secs)
+        } else {
+            step_down(w.secs)
+        };
+        self.enable_watch(secs);
+    }
+
+    /// 실제로 적용되는 감시 간격. 큰 폴더라 스캔이 오래 걸리면 디스크를 계속 읽지 않도록
+    /// 마지막 스캔 시간의 2배까지 간격을 늘린다.
+    pub fn watch_effective(&self) -> Option<Duration> {
+        let w = self.watch.as_ref()?;
+        let took = self.last_scan.map_or(Duration::ZERO, |d| d * 2);
+        Some(Duration::from_secs(w.secs).max(took))
+    }
+
+    /// 다음 감시 스캔까지 남은 시간
+    pub fn watch_next_in(&self, now: Instant) -> Option<Duration> {
+        self.watch
+            .as_ref()
+            .map(|w| w.next_at.saturating_duration_since(now))
+    }
+
+    /// 지금 감시 스캔을 시작할 때인지. 스캔 중에는 겹치지 않게 항상 `false`.
+    pub fn watch_due(&self, now: Instant) -> bool {
+        self.scanning.is_none() && self.watch.as_ref().is_some_and(|w| now >= w.next_at)
+    }
+
+    /// 스캔이 하나 끝날 때마다 다음 감시 시각을 "끝난 시점부터" 다시 잡는다.
+    fn schedule_next(&mut self) {
+        let Some(effective) = self.watch_effective() else {
+            return;
+        };
+        if let Some(w) = &mut self.watch {
+            w.next_at = Instant::now() + effective;
+        }
+    }
+
+    /// 방금 갱신에서 `name` 항목의 크기가 달라졌다면 그 변화 (일정 시간 동안만)
+    pub fn change_of(&self, name: &str) -> Option<Change> {
+        if self.changes.dir != self.current {
+            return None;
+        }
+        self.changes
+            .map
+            .get(name)
+            .copied()
+            .filter(|c| c.at.elapsed() < CHANGE_VISIBLE)
+    }
+
+    // ---- 오류 목록 --------------------------------------------------------
+
     /// 오류 목록 팝업을 열고 닫는다. 현재 폴더 하위에 읽지 못한 경로가 없으면 열지 않는다.
     pub fn toggle_errors(&mut self) {
         if self.show_errors {
             self.show_errors = false;
             return;
         }
-        self.error_view = self
-            .errors
-            .list
-            .iter()
-            .filter(|e| e.path.starts_with(&self.current))
-            .cloned()
-            .collect();
+        self.refresh_error_view();
         if !self.error_view.is_empty() {
             self.error_state.select(Some(0));
             self.show_errors = true;
@@ -210,9 +351,38 @@ impl App {
         self.error_state.select(Some(i));
     }
 
-    /// 매 프레임 호출한다. 스캔이 끝났으면 결과를 반영한다.
+    /// 현재 폴더 하위의 오류 목록을 다시 만든다. 팝업이 열려 있으면 스크롤 위치를 유지하고,
+    /// 보여 줄 오류가 없어졌으면 닫는다.
+    fn refresh_error_view(&mut self) {
+        self.error_view = self
+            .errors
+            .list
+            .iter()
+            .filter(|e| e.path.starts_with(&self.current))
+            .cloned()
+            .collect();
+        if self.error_view.is_empty() {
+            self.show_errors = false;
+            self.error_state.select(None);
+        } else {
+            let i = self.error_state.selected().unwrap_or(0);
+            self.error_state.select(Some(i.min(self.error_view.len() - 1)));
+        }
+    }
+
+    // ---- 스캔 -------------------------------------------------------------
+
+    /// 매 프레임 호출한다. 감시 스캔을 시작할 때가 되었으면 시작하고,
+    /// 스캔이 끝났으면 결과를 반영한다.
     pub fn poll_scan(&mut self) {
         self.tick = self.tick.wrapping_add(1);
+
+        if self.watch_due(Instant::now()) {
+            self.rescan();
+        }
+        if self.tick % 100 == 0 {
+            self.changes.map.retain(|_, c| c.at.elapsed() < CHANGE_VISIBLE);
+        }
 
         let Some(rx) = &self.rx else { return };
         match rx.try_recv() {
@@ -221,8 +391,10 @@ impl App {
             Err(TryRecvError::Disconnected) => {
                 // 스캔 스레드가 결과 없이 종료됨 (패닉 등)
                 self.scanning = None;
+                self.refreshing = false;
                 self.rx = None;
                 self.status = Some("스캔이 중단되었습니다".into());
+                self.schedule_next();
             }
         }
     }
@@ -232,6 +404,7 @@ impl App {
         let (tx, rx) = mpsc::channel();
         self.rx = Some(rx);
         self.scanning = Some(dir.clone());
+        self.refreshing = matches!(target, Target::Subtree);
 
         thread::spawn(move || {
             let started = Instant::now();
@@ -247,11 +420,16 @@ impl App {
         });
     }
 
-    /// 스캔 결과를 반영한다. 실패하면 이전 화면을 그대로 두고 메시지만 남긴다.
     fn finish_scan(&mut self, done: ScanDone) {
         self.scanning = None;
+        self.refreshing = false;
         self.rx = None;
+        self.apply_scan(done);
+        self.schedule_next();
+    }
 
+    /// 스캔 결과를 반영한다. 실패하면 이전 화면을 그대로 두고 메시지만 남긴다.
+    fn apply_scan(&mut self, done: ScanDone) {
         let out = match done.result {
             Ok(out) => out,
             Err(e) => {
@@ -273,6 +451,8 @@ impl App {
                     .and_then(|name| self.children().iter().position(|c| &*c.name == name))
                     .or(if self.children().is_empty() { None } else { Some(0) });
                 self.state.select(index);
+                self.changes = Changes::default();
+                self.last_change = None;
                 self.error_view.clear();
                 self.show_errors = false;
             }
@@ -282,6 +462,15 @@ impl App {
                 };
                 let removed = self.node_at(&names).map_or(0, |n| n.unreadable as usize);
                 let selected = self.selected_name();
+                // 갱신 전의 현재 폴더 상태. 갱신 후와 비교해 무엇이 달라졌는지 알아낸다.
+                let before_dir = self.current.clone();
+                let before_total = self.total_size();
+                let before_sizes: HashMap<String, u64> = self
+                    .children()
+                    .iter()
+                    .map(|c| (c.name.to_string(), c.size))
+                    .collect();
+
                 if !self.root.replace_at(&names, out.root) {
                     // 스캔하는 사이 상위 폴더 구조가 바뀌었다
                     self.status = Some("폴더 구조가 바뀌어 갱신하지 못했습니다".into());
@@ -289,12 +478,51 @@ impl App {
                 }
                 self.errors.replace_under(&done.dir, removed, out.errors);
                 self.reindex(selected);
-                self.error_view.clear();
-                self.show_errors = false;
+                if self.current == before_dir {
+                    self.record_changes(&before_sizes, before_total);
+                }
+                self.refresh_error_view();
             }
         }
 
         self.last_scan = Some(done.elapsed);
+        self.last_checked = Some(Instant::now());
+    }
+
+    /// 갱신 전후의 현재 폴더 항목 크기를 비교해 달라진 것을 기록한다.
+    fn record_changes(&mut self, before: &HashMap<String, u64>, before_total: u64) {
+        let now = Instant::now();
+        let mut map = if self.changes.dir == self.current {
+            std::mem::take(&mut self.changes.map)
+        } else {
+            HashMap::new()
+        };
+
+        for c in self.children() {
+            let change = match before.get(&*c.name) {
+                Some(&old) if old != c.size => Change {
+                    delta: c.size as i64 - old as i64,
+                    is_new: false,
+                    at: now,
+                },
+                None => Change {
+                    delta: c.size as i64,
+                    is_new: true,
+                    at: now,
+                },
+                _ => continue,
+            };
+            map.insert(c.name.to_string(), change);
+        }
+        self.changes = Changes {
+            dir: self.current.clone(),
+            map,
+        };
+
+        let total_delta = self.total_size() as i64 - before_total as i64;
+        if total_delta != 0 {
+            self.last_change = Some((now, total_delta));
+        }
     }
 
     /// `dir`이 트리 루트 아래(또는 루트 자신)일 때, 루트에서 거기까지의 폴더 이름들
@@ -435,6 +663,7 @@ mod tests {
         // 밖에서 a/b에 큰 파일이 생겼다. 현재 폴더만 다시 스캔한다.
         fs::write(root.join("a/b/big"), vec![1u8; 500_000]).unwrap();
         app.rescan();
+        assert!(app.refreshing, "a rescan keeps the old data on screen");
         wait(&mut app);
 
         assert_eq!(app.current, root.join("a/b"));
@@ -464,12 +693,115 @@ mod tests {
         wait(&mut app);
         app.back(); // 트리 루트(x)보다 위 → 부모를 새로 스캔
         assert!(app.scanning.is_some());
+        assert!(!app.refreshing, "a new-root scan has no old data to keep");
         wait(&mut app);
 
         assert_eq!(app.current, root);
         assert_eq!(names(&app), ["y", "x"]);
         let selected = app.state.selected().unwrap();
         assert_eq!(&*app.children()[selected].name, "x"); // 떠나온 폴더가 선택됨
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_refresh_reports_what_grew_what_is_new_and_what_stayed() {
+        let root = temp_root("changes");
+        fs::write(root.join("grows"), vec![1u8; 100_000]).unwrap();
+        fs::write(root.join("same"), vec![1u8; 10_000]).unwrap();
+
+        let mut app = App::new(root.clone());
+        wait(&mut app);
+        assert!(app.change_of("grows").is_none(), "nothing to compare on the first scan");
+        assert!(app.last_change.is_none());
+
+        fs::write(root.join("grows"), vec![1u8; 400_000]).unwrap();
+        fs::write(root.join("fresh"), vec![1u8; 50_000]).unwrap();
+        app.rescan();
+        wait(&mut app);
+
+        let grows = app.change_of("grows").expect("grows should be flagged");
+        assert!(!grows.is_new);
+        assert!(grows.delta >= 250_000, "delta was {}", grows.delta);
+
+        let fresh = app.change_of("fresh").expect("fresh should be flagged");
+        assert!(fresh.is_new);
+        assert!(fresh.delta >= 50_000);
+
+        assert!(app.change_of("same").is_none(), "unchanged entries are not flagged");
+
+        let (_, total) = app.last_change.expect("the total changed");
+        assert_eq!(total, grows.delta + fresh.delta);
+
+        // 한 번 더 갱신해도 변화가 없으면 기존 표시는 그대로 남고 확인 시각만 갱신된다
+        let checked = app.last_checked;
+        app.rescan();
+        wait(&mut app);
+        assert!(app.change_of("grows").is_some());
+        assert!(app.last_checked > checked);
+
+        // 다른 폴더를 보고 있을 때는 변화 표시가 보이지 않는다
+        fs::create_dir_all(root.join("sub")).unwrap();
+        app.rescan();
+        wait(&mut app);
+        let sub = names(&app).iter().position(|n| n == "sub").unwrap();
+        app.state.select(Some(sub));
+        app.enter();
+        assert!(app.change_of("grows").is_none());
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn watch_intervals_step_with_a_floor_and_no_ceiling() {
+        assert_eq!(step_up(2), 3);
+        assert_eq!(step_up(5), 10);
+        assert_eq!(step_up(3600), 7200);
+        assert_eq!(step_up(7200), 14400);
+        assert_eq!(step_down(10), 5);
+        assert_eq!(step_down(3), 2);
+        assert_eq!(step_down(2), MIN_WATCH_SECS); // 더 내려가지 않는다
+        assert_eq!(step_down(7200), 3600);
+    }
+
+    #[test]
+    fn watch_never_overlaps_scans_and_slows_down_for_big_folders() {
+        let root = temp_root("watch");
+        fs::write(root.join("f"), vec![1u8; 1_000]).unwrap();
+        let mut app = App::new(root.clone());
+        wait(&mut app);
+
+        assert!(!app.watch_due(Instant::now()), "watch is off by default");
+
+        app.enable_watch(1); // 최솟값으로 올라간다
+        assert_eq!(app.watch.as_ref().unwrap().secs, MIN_WATCH_SECS);
+
+        let now = Instant::now();
+        assert!(!app.watch_due(now), "not due right after being scheduled");
+        assert!(app.watch_due(now + Duration::from_secs(3)));
+
+        // 스캔 중에는 시각이 지났어도 시작하지 않는다
+        app.rescan();
+        assert!(!app.watch_due(now + Duration::from_secs(60)));
+        wait(&mut app);
+
+        // 간격 < 마지막 스캔 시간 × 2 이면 실제 간격이 늘어난다
+        app.last_scan = Some(Duration::from_secs(10));
+        assert_eq!(app.watch_effective(), Some(Duration::from_secs(20)));
+        app.last_scan = Some(Duration::from_millis(100));
+        assert_eq!(app.watch_effective(), Some(Duration::from_secs(MIN_WATCH_SECS)));
+
+        // 간격 조절과 껐다 켜기
+        app.enable_watch(5);
+        app.adjust_watch(true);
+        assert_eq!(app.watch.as_ref().unwrap().secs, 10);
+        app.adjust_watch(false);
+        app.adjust_watch(false);
+        assert_eq!(app.watch.as_ref().unwrap().secs, 3);
+        app.toggle_watch();
+        assert!(app.watch.is_none());
+        app.toggle_watch(); // 마지막에 쓴 간격을 기억한다
+        assert_eq!(app.watch.as_ref().unwrap().secs, 3);
 
         fs::remove_dir_all(&root).unwrap();
     }

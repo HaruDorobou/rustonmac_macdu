@@ -32,6 +32,9 @@ fn main() -> io::Result<()> {
     // App::new가 곧바로 스캔을 시작하므로, 그보다 먼저 스레드 풀을 설정해야 한다
     scanner::init_thread_pool(opts.threads);
     let mut app = App::new(std::env::current_dir()?);
+    if let Some(secs) = opts.watch {
+        app.enable_watch(secs);
+    }
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -74,6 +77,10 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> io::
                 match key.code {
                     KeyCode::Char('e') => app.toggle_errors(),
                     KeyCode::Char('r') => app.rescan(),
+                    KeyCode::Char('w') => app.toggle_watch(),
+                    // + 는 Shift가 필요하므로 같은 키의 = 도 받는다
+                    KeyCode::Char('+') | KeyCode::Char('=') => app.adjust_watch(true),
+                    KeyCode::Char('-') => app.adjust_watch(false),
                     KeyCode::Char('q') | KeyCode::Esc => app.should_quit = true,
                     KeyCode::Up | KeyCode::Char('k') => app.previous(),
                     KeyCode::Down | KeyCode::Char('j') => app.next(),
