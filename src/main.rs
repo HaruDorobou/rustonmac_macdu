@@ -15,9 +15,7 @@ use ratatui::{backend::CrosstermBackend, Terminal};
 use app::App;
 
 fn main() -> io::Result<()> {
-    let root = std::env::current_dir()?;
-    let entries = scanner::scan_dir(&root)?;
-    let mut app = App::new(root, entries);
+    let mut app = App::new(std::env::current_dir()?)?;
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -48,6 +46,8 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> io::
                     KeyCode::Char('q') | KeyCode::Esc => app.should_quit = true,
                     KeyCode::Up | KeyCode::Char('k') => app.previous(),
                     KeyCode::Down | KeyCode::Char('j') => app.next(),
+                    KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => app.enter(),
+                    KeyCode::Backspace | KeyCode::Left | KeyCode::Char('h') => app.back(),
                     _ => {}
                 }
             }

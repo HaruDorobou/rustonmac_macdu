@@ -1,11 +1,12 @@
 use std::fs;
 use std::io;
 use std::os::unix::fs::MetadataExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone)]
 pub struct Entry {
     pub name: String,
+    pub path: PathBuf,
     pub is_dir: bool,
     /// 디스크 실제 사용량 (바이트). 논리 크기가 아니라 할당된 블록 기준.
     pub size: u64,
@@ -25,6 +26,7 @@ pub fn scan_dir(root: &Path) -> io::Result<Vec<Entry>> {
 
         entries.push(Entry {
             name: dirent.file_name().to_string_lossy().into_owned(),
+            path,
             is_dir,
             size,
         });

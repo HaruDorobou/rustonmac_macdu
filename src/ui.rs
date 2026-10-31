@@ -21,7 +21,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     // 헤더: 현재 경로와 총 용량
     let header = Paragraph::new(format!(
         " {}   (합계: {})",
-        app.root.display(),
+        app.current.display(),
         human(app.total_size())
     ))
     .block(Block::default().borders(Borders::ALL).title(" mac-du "));
@@ -61,9 +61,12 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         .highlight_symbol("> ");
     f.render_stateful_widget(list, chunks[1], &mut app.state);
 
-    // 푸터: 키 도움말
-    let footer = Paragraph::new(" j/k, ↑/↓: 이동   q/Esc: 종료")
-        .style(Style::default().fg(Color::DarkGray));
+    // 푸터: 오류 메시지가 있으면 그것을, 없으면 키 도움말
+    let footer = match &app.status {
+        Some(msg) => Paragraph::new(format!(" ⚠ {}", msg)).style(Style::default().fg(Color::Red)),
+        None => Paragraph::new(" j/k: 이동   l/Enter: 들어가기   h/Backspace: 상위   q/Esc: 종료")
+            .style(Style::default().fg(Color::DarkGray)),
+    };
     f.render_widget(footer, chunks[2]);
 }
 
