@@ -8,17 +8,59 @@ use std::sync::Mutex;
 
 use rayon::prelude::*;
 
-#[derive(Debug, Clone)]
-pub struct Entry {
-    pub name: String,
-    pub path: PathBuf,
+/// 스캔 결과 트리의 노드 하나 (파일 또는 폴더).
+///
+/// 폴더를 한 번 훑으면 하위 전체의 크기를 이미 계산하게 되므로, 그 결과를 버리지 않고
+/// 트리로 들고 있다. 그러면 폴더를 오가는 일이 다시 스캔 없이 즉시 된다.
+/// 메모리를 아끼려고 이름은 `Box<str>`, 자식은 `Box<[Node]>`로 들고 있다.
+#[derive(Debug)]
+pub struct Node {
+    pub name: Box<str>,
     pub is_dir: bool,
     /// 디스크 실제 사용량 (바이트). 논리 크기가 아니라 할당된 블록 기준.
     /// `unreadable > 0`이면 읽지 못한 부분이 빠져 있으므로 실제보다 작은 값이다.
     pub size: u64,
-    /// 이 항목 안(폴더면 하위 전체, 항목 자체를 못 읽었으면 자기 자신 포함)에서
+    /// 이 노드 안(폴더면 하위 전체, 노드 자체를 못 읽었으면 자기 자신 포함)에서
     /// 읽지 못한 경로의 수
-    pub unreadable: usize,
+    pub unreadable: u32,
+    /// 폴더면 하위 항목들 (크기 내림차순). 파일이면 비어 있다.
+    pub children: Box<[Node]>,
+}
+
+impl Node {
+    pub fn empty() -> Self {
+        Node {
+            name: "".into(),
+            is_dir: true,
+            size: 0,
+            unreadable: 0,
+            children: Box::new([]),
+        }
+    }
+
+    /// `path`(루트 아래 폴더 이름들)가 가리키는 폴더의 내용을 `new`로 바꾸고,
+    /// 지나온 상위 폴더들의 크기와 정렬을 다시 계산한다. 경로가 없으면 `false`.
+    pub fn replace_at(&mut self, path: &[String], new: Node) -> bool {
+        let Some((first, rest)) = path.split_first() else {
+            let name = std::mem::take(&mut self.name);
+            *self = Node { name, ..new };
+            return true;
+        };
+        let Some(idx) = self
+            .children
+            .iter()
+            .position(|c| c.is_dir && *c.name == **first)
+        else {
+            return false;
+        };
+        if !self.children[idx].replace_at(rest, new) {
+            return false;
+        }
+        self.size = self.children.iter().map(|c| c.size).sum();
+        self.unreadable = self.children.iter().map(|c| c.unreadable).sum();
+        self.children.sort_by(|a, b| b.size.cmp(&a.size));
+        true
+    }
 }
 
 /// 스캔 중 읽지 못한 경로 하나
@@ -38,19 +80,22 @@ pub struct ErrorReport {
     pub total: usize,
 }
 
-impl ErrorReport {
-    fn merge(&mut self, other: ErrorReport) {
-        self.total += other.total;
-        let room = MAX_REPORTED.saturating_sub(self.list.len());
-        self.list.extend(other.list.into_iter().take(room));
-    }
-}
-
 /// 오류가 아주 많아도 메모리를 아끼기 위해 기록하는 건수에 상한을 둔다.
 const MAX_REPORTED: usize = 2000;
 
+impl ErrorReport {
+    /// `dir` 아래 경로의 오류 기록을 지우고, 다시 스캔한 결과 `fresh`로 바꾼다.
+    pub fn replace_under(&mut self, dir: &Path, removed_count: usize, fresh: ErrorReport) {
+        self.list.retain(|e| !e.path.starts_with(dir));
+        self.total = self.total.saturating_sub(removed_count) + fresh.total;
+        let room = MAX_REPORTED.saturating_sub(self.list.len());
+        self.list.extend(fresh.list.into_iter().take(room));
+    }
+}
+
 pub struct ScanOutput {
-    pub entries: Vec<Entry>,
+    /// 스캔한 폴더 자체를 나타내는 노드 (`name`은 비어 있다)
+    pub root: Node,
     pub errors: ErrorReport,
 }
 
@@ -95,73 +140,67 @@ pub fn init_thread_pool(threads: Option<usize>) {
     let _ = rayon::ThreadPoolBuilder::new().num_threads(n).build_global();
 }
 
-/// `root`의 직계 자식들을 병렬로 스캔해 용량 내림차순으로 반환한다.
+/// `root` 아래 전체를 병렬로 스캔해 트리로 반환한다. 각 폴더의 자식은 크기 내림차순이다.
 /// `root` 자체를 열 수 없으면 `Err`. 그 아래에서 읽지 못한 경로는 `errors`에 모은다.
-pub fn scan_dir(root: &Path) -> io::Result<ScanOutput> {
-    let root_log = ErrorLog::default();
-    let raws = read_dir_bulk(root, &root_log)?;
+pub fn scan_tree(root: &Path) -> io::Result<ScanOutput> {
+    let log = ErrorLog::default();
+    let raws = read_dir_bulk(root, &log)?;
+    let root = build_dir_node("".into(), root, raws, &log);
+    Ok(ScanOutput {
+        root,
+        errors: log.into_report(),
+    })
+}
 
-    // 항목마다 자기 기록장을 써서 "이 항목 안에서 읽지 못한 건수"를 따로 센다
-    let results: Vec<(Entry, ErrorReport)> = raws
-        .par_iter()
-        .map(|raw| {
-            let path = root.join(&raw.name);
-            let is_dir = raw.kind == Kind::Dir;
-            let log = ErrorLog::default();
-            // 항목 자체를 못 읽은 폴더는 들어가 봐야 같은 오류만 반복되므로 건너뛴다
-            let size = if is_dir && !raw.failed {
-                dir_size(&path, &log)
-            } else {
-                raw.alloc
-            };
-            let report = log.into_report();
-            let entry = Entry {
-                name: raw.name.clone(),
-                path,
-                is_dir,
-                size,
-                unreadable: report.total + usize::from(raw.failed),
-            };
-            (entry, report)
+/// 폴더를 열어서 노드로 만든다. 열지 못하면 오류를 기록하고 비어 있는 노드를 돌려준다.
+fn scan_dir_node(name: Box<str>, path: &Path, log: &ErrorLog) -> Node {
+    match read_dir_bulk(path, log) {
+        Ok(raws) => build_dir_node(name, path, raws, log),
+        Err(e) => {
+            log.push(path.to_path_buf(), e.raw_os_error().unwrap_or(0));
+            Node {
+                name,
+                is_dir: true,
+                size: 0,
+                unreadable: 1,
+                children: Box::new([]),
+            }
+        }
+    }
+}
+
+/// 이미 읽은 항목 목록으로 폴더 노드를 만든다. 하위 폴더는 병렬로 재귀한다.
+/// 심볼릭 링크는 따라가지 않는다 (순환 방지).
+fn build_dir_node(name: Box<str>, path: &Path, raws: Vec<Raw>, log: &ErrorLog) -> Node {
+    // 파일은 값싸게 바로 처리하고, 하위 폴더만 병렬로 재귀한다
+    let (dirs, others): (Vec<Raw>, Vec<Raw>) = raws
+        .into_iter()
+        .partition(|r| r.kind == Kind::Dir && !r.failed);
+
+    let mut children: Vec<Node> = others
+        .into_iter()
+        .map(|r| Node {
+            is_dir: r.kind == Kind::Dir,
+            size: r.alloc,
+            unreadable: u32::from(r.failed),
+            name: r.name.into_boxed_str(),
+            children: Box::new([]),
         })
         .collect();
 
-    // 항목 자체를 못 읽은 경우는 root_log에 이미 들어 있다
-    let mut errors = root_log.into_report();
-    let mut entries = Vec::with_capacity(results.len());
-    for (entry, report) in results {
-        errors.merge(report);
-        entries.push(entry);
+    children.par_extend(dirs.into_par_iter().map(|r| {
+        let child_path = path.join(&r.name);
+        scan_dir_node(r.name.into_boxed_str(), &child_path, log)
+    }));
+
+    children.sort_unstable_by(|a, b| b.size.cmp(&a.size));
+    Node {
+        name,
+        is_dir: true,
+        size: children.iter().map(|c| c.size).sum(),
+        unreadable: children.iter().map(|c| c.unreadable).sum(),
+        children: children.into_boxed_slice(),
     }
-
-    entries.sort_by(|a, b| b.size.cmp(&a.size));
-    Ok(ScanOutput { entries, errors })
-}
-
-/// 디렉토리를 재귀적으로(병렬로) 합산한다.
-/// 심볼릭 링크는 따라가지 않는다 (순환 방지).
-/// 읽지 못한 곳은 0으로 취급하되 `log`에 기록한다.
-fn dir_size(path: &Path, log: &ErrorLog) -> u64 {
-    let raws = match read_dir_bulk(path, log) {
-        Ok(raws) => raws,
-        Err(e) => {
-            log.push(path.to_path_buf(), e.raw_os_error().unwrap_or(0));
-            return 0;
-        }
-    };
-
-    let files: u64 = raws
-        .iter()
-        .filter(|r| r.kind != Kind::Dir)
-        .map(|r| r.alloc)
-        .sum();
-    let subdirs: u64 = raws
-        .par_iter()
-        .filter(|r| r.kind == Kind::Dir && !r.failed)
-        .map(|r| dir_size(&path.join(&r.name), log))
-        .sum();
-
-    files + subdirs
 }
 
 // ---------------------------------------------------------------------------
@@ -359,6 +398,22 @@ fn parse_entry(e: &[u8]) -> Option<Parsed> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn temp_root(tag: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("mac-du-{}-{}", tag, std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn child<'a>(node: &'a Node, name: &str) -> &'a Node {
+        node.children
+            .iter()
+            .find(|c| &*c.name == name)
+            .unwrap_or_else(|| panic!("no child named {name}"))
+    }
 
     #[test]
     fn scan_threads_is_capped() {
@@ -371,12 +426,68 @@ mod tests {
     }
 
     #[test]
-    fn unreadable_dir_is_reported_not_silently_dropped() {
-        use std::fs;
-        use std::os::unix::fs::PermissionsExt;
+    fn tree_keeps_every_level_with_consistent_sizes() {
+        let root = temp_root("tree");
+        fs::create_dir_all(root.join("a/b")).unwrap();
+        fs::write(root.join("a/small"), vec![1u8; 100]).unwrap();
+        fs::write(root.join("a/b/big"), vec![1u8; 200_000]).unwrap();
+        fs::write(root.join("top"), vec![1u8; 5_000]).unwrap();
 
-        let root = std::env::temp_dir().join(format!("mac-du-test-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
+        let out = scan_tree(&root).unwrap();
+        fs::remove_dir_all(&root).unwrap();
+
+        let a = child(&out.root, "a");
+        let b = child(a, "b");
+        let big = child(b, "big");
+        assert!(a.is_dir && b.is_dir && !big.is_dir);
+        assert!(big.size >= 200_000);
+
+        // 폴더 크기는 자식 크기의 합이다 (모든 단계에서)
+        assert_eq!(b.size, b.children.iter().map(|c| c.size).sum::<u64>());
+        assert_eq!(a.size, a.children.iter().map(|c| c.size).sum::<u64>());
+        assert_eq!(out.root.size, out.root.children.iter().map(|c| c.size).sum::<u64>());
+        assert!(a.size >= b.size);
+
+        // 자식은 크기 내림차순
+        for n in [&out.root, a, b] {
+            assert!(n.children.windows(2).all(|w| w[0].size >= w[1].size));
+        }
+        assert_eq!(out.errors.total, 0);
+    }
+
+    #[test]
+    fn replace_at_updates_ancestor_sizes_and_order() {
+        let root = temp_root("graft");
+        fs::create_dir_all(root.join("a/b")).unwrap();
+        fs::create_dir_all(root.join("c")).unwrap();
+        fs::write(root.join("a/b/f"), vec![1u8; 50_000]).unwrap();
+        fs::write(root.join("c/f"), vec![1u8; 100_000]).unwrap();
+
+        let mut tree = scan_tree(&root).unwrap().root;
+        // 처음에는 c(100k)가 a(50k)보다 크다
+        assert_eq!(&*tree.children[0].name, "c");
+
+        // a/b 안에 큰 파일을 추가하고, a/b만 다시 스캔해 끼워 넣는다
+        fs::write(root.join("a/b/g"), vec![1u8; 400_000]).unwrap();
+        let fresh = scan_tree(&root.join("a/b")).unwrap().root;
+        let ok = tree.replace_at(&["a".to_string(), "b".to_string()], fresh);
+        fs::remove_dir_all(&root).unwrap();
+
+        assert!(ok);
+        // a가 커져서 순서가 바뀌고, 루트 합계도 새 값과 맞아야 한다
+        assert_eq!(&*tree.children[0].name, "a");
+        let a = child(&tree, "a");
+        let b = child(a, "b");
+        assert!(b.size >= 450_000);
+        assert_eq!(a.size, b.size);
+        assert_eq!(tree.size, a.size + child(&tree, "c").size);
+        // 없는 경로는 실패하고 트리를 바꾸지 않는다
+        assert!(!tree.replace_at(&["nope".to_string()], Node::empty()));
+    }
+
+    #[test]
+    fn unreadable_dir_is_reported_not_silently_dropped() {
+        let root = temp_root("locked");
         fs::create_dir_all(root.join("ok")).unwrap();
         fs::create_dir_all(root.join("locked")).unwrap();
         fs::write(root.join("ok/file"), vec![1u8; 10_000]).unwrap();
@@ -385,7 +496,7 @@ mod tests {
         // root 권한으로 돌리면 접근 제한이 적용되지 않아 검증할 수 없다
         let restricted = fs::read_dir(root.join("locked")).is_err();
 
-        let out = scan_dir(&root).unwrap();
+        let out = scan_tree(&root).unwrap();
 
         // 지우려면 권한을 되돌려야 한다. 단언이 실패해도 임시 폴더가 남지 않게 먼저 정리한다.
         fs::set_permissions(root.join("locked"), fs::Permissions::from_mode(0o755)).unwrap();
@@ -398,28 +509,25 @@ mod tests {
         assert!(out.errors.list[0].path.ends_with("locked"));
         assert_eq!(out.errors.list[0].errno, 13); // EACCES
 
-        let locked = out.entries.iter().find(|e| e.name == "locked").unwrap();
+        let locked = child(&out.root, "locked");
         assert_eq!(locked.size, 0);
         assert_eq!(locked.unreadable, 1);
-        let ok = out.entries.iter().find(|e| e.name == "ok").unwrap();
+        let ok = child(&out.root, "ok");
         assert!(ok.size >= 10_000);
         assert_eq!(ok.unreadable, 0);
+        assert_eq!(out.root.unreadable, 1);
     }
 
     #[test]
-    fn nested_unreadable_marks_every_ancestor_entry() {
-        use std::fs;
-        use std::os::unix::fs::PermissionsExt;
-
-        let root = std::env::temp_dir().join(format!("mac-du-nested-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
+    fn nested_unreadable_marks_every_ancestor() {
+        let root = temp_root("nested");
         let inner = root.join("outer/mid/locked");
         fs::create_dir_all(&inner).unwrap();
         fs::write(root.join("outer/data"), vec![1u8; 10_000]).unwrap();
         fs::set_permissions(&inner, fs::Permissions::from_mode(0o000)).unwrap();
 
         let restricted = fs::read_dir(&inner).is_err();
-        let out = scan_dir(&root).unwrap();
+        let out = scan_tree(&root).unwrap();
 
         fs::set_permissions(&inner, fs::Permissions::from_mode(0o755)).unwrap();
         fs::remove_dir_all(&root).unwrap();
@@ -427,11 +535,11 @@ mod tests {
         if !restricted {
             return;
         }
-        // scan_dir(root)의 직계 자식은 outer 하나다. 안쪽 깊은 곳의 오류가 outer에 집계돼야 한다.
-        assert_eq!(out.entries.len(), 1);
-        assert_eq!(out.entries[0].name, "outer");
-        assert_eq!(out.entries[0].unreadable, 1);
-        assert!(out.entries[0].size >= 10_000);
+        let outer = child(&out.root, "outer");
+        assert_eq!(outer.unreadable, 1);
+        assert_eq!(child(outer, "mid").unreadable, 1);
+        assert!(outer.size >= 10_000);
+        assert_eq!(out.root.unreadable, 1);
         assert_eq!(out.errors.total, 1);
     }
 }

@@ -32,7 +32,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
                 .map(|d| format!(" · 스캔 {:.2}초", d.as_secs_f64()))
                 .unwrap_or_default();
             // 읽지 못한 경로가 있으면 합계는 실제보다 작을 수 있다
-            let at_least = if app.errors.total > 0 { "≥ " } else { "" };
+            let at_least = if app.unreadable_here() > 0 { "≥ " } else { "" };
             format!(
                 " {}   (합계: {}{}{})",
                 app.current.display(),
@@ -43,9 +43,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         }
     };
     let mut header_spans = vec![Span::raw(header_text)];
-    if app.scanning.is_none() && app.errors.total > 0 {
+    if app.scanning.is_none() && app.unreadable_here() > 0 {
         header_spans.push(Span::styled(
-            format!("   ⚠ 읽지 못한 경로 {}건 (e)", app.errors.total),
+            format!("   ⚠ 읽지 못한 경로 {}건 (e)", app.unreadable_here()),
             Style::default().fg(Color::Yellow),
         ));
     }
@@ -55,10 +55,10 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 
     // 목록: 용량 막대 + 비율 + 이름
     let total = app.total_size().max(1);
-    let max = app.entries.iter().map(|e| e.size).max().unwrap_or(1).max(1);
+    let max = app.children().iter().map(|e| e.size).max().unwrap_or(1).max(1);
 
     let items: Vec<ListItem> = app
-        .entries
+        .children()
         .iter()
         .map(|e| {
             let filled = (e.size as f64 / max as f64 * BAR_WIDTH as f64).round() as usize;
@@ -100,7 +100,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     let footer = match &app.status {
         Some(msg) => Paragraph::new(format!(" ⚠ {}", msg)).style(Style::default().fg(Color::Red)),
         None => {
-            let errors_hint = if app.errors.total > 0 { "   e: 오류 목록" } else { "" };
+            let errors_hint = if app.unreadable_here() > 0 { "   e: 오류 목록" } else { "" };
             Paragraph::new(format!(
                 " j/k: 이동   l/Enter: 들어가기   h/Backspace: 상위   r: 다시 스캔{}   q/Esc: 종료",
                 errors_hint
@@ -120,22 +120,19 @@ fn draw_errors(f: &mut Frame, app: &mut App) {
     let area = centered(f.area(), 90, 70);
     f.render_widget(Clear, area);
 
-    let shown = app.errors.list.len();
-    let title = if app.errors.total > shown {
+    let shown = app.error_view.len();
+    let total = app.unreadable_here() as usize;
+    let title = if total > shown {
         format!(
             " 읽지 못한 경로 {}건 (앞 {}건만 표시) — j/k 이동, Esc 닫기 ",
-            app.errors.total, shown
+            total, shown
         )
     } else {
-        format!(
-            " 읽지 못한 경로 {}건 — j/k 이동, Esc 닫기 ",
-            app.errors.total
-        )
+        format!(" 읽지 못한 경로 {}건 — j/k 이동, Esc 닫기 ", total)
     };
 
     let items: Vec<ListItem> = app
-        .errors
-        .list
+        .error_view
         .iter()
         .map(|e| {
             ListItem::new(Line::from(vec![
