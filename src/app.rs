@@ -6,13 +6,13 @@ use std::time::{Duration, Instant};
 
 use ratatui::widgets::ListState;
 
-use crate::scanner::{self, Entry};
+use crate::scanner::{self, Entry, ErrorReport, ScanOutput};
 
 /// 백그라운드 스캔이 끝났을 때 UI 스레드로 보내는 결과
 struct ScanDone {
     dir: PathBuf,
     select: Option<String>,
-    result: io::Result<Vec<Entry>>,
+    result: io::Result<ScanOutput>,
     /// 스캔 스레드 안에서 잰 소요 시간 (UI 렌더링 시간 제외)
     elapsed: Duration,
 }
@@ -31,6 +31,11 @@ pub struct App {
     pub tick: usize,
     /// 현재 화면을 만든 스캔의 소요 시간
     pub last_scan: Option<Duration>,
+    /// 현재 화면을 만든 스캔에서 읽지 못한 경로들
+    pub errors: ErrorReport,
+    /// 오류 목록 팝업이 열려 있는지
+    pub show_errors: bool,
+    pub error_state: ListState,
     rx: Option<Receiver<ScanDone>>,
 }
 
@@ -45,6 +50,9 @@ impl App {
             scanning: None,
             tick: 0,
             last_scan: None,
+            errors: ErrorReport::default(),
+            show_errors: false,
+            error_state: ListState::default(),
             rx: None,
         };
         app.start_scan(current, None);
@@ -95,8 +103,44 @@ impl App {
         self.start_scan(parent, left_name);
     }
 
+    /// 현재 폴더를 다시 스캔한다. 권한을 허용해 준 뒤 결과를 갱신할 때 쓴다.
+    /// 보던 항목은 그대로 선택해 둔다. 스캔 중이면 무시한다.
+    pub fn rescan(&mut self) {
+        if self.scanning.is_some() {
+            return;
+        }
+        let selected = self.selected_entry().map(|e| e.name.clone());
+        self.start_scan(self.current.clone(), selected);
+    }
+
     pub fn total_size(&self) -> u64 {
         self.entries.iter().map(|e| e.size).sum()
+    }
+
+    /// 오류 목록 팝업을 열고 닫는다. 오류가 없으면 열지 않는다.
+    pub fn toggle_errors(&mut self) {
+        if self.show_errors {
+            self.show_errors = false;
+        } else if !self.errors.list.is_empty() {
+            self.show_errors = true;
+        }
+    }
+
+    pub fn error_next(&mut self) {
+        if self.errors.list.is_empty() {
+            return;
+        }
+        let last = self.errors.list.len() - 1;
+        let i = self.error_state.selected().map_or(0, |i| (i + 1).min(last));
+        self.error_state.select(Some(i));
+    }
+
+    pub fn error_previous(&mut self) {
+        if self.errors.list.is_empty() {
+            return;
+        }
+        let i = self.error_state.selected().map_or(0, |i| i.saturating_sub(1));
+        self.error_state.select(Some(i));
     }
 
     /// 매 프레임 호출한다. 스캔이 끝났으면 결과를 반영한다.
@@ -147,7 +191,7 @@ impl App {
         self.rx = None;
 
         match done.result {
-            Ok(entries) => {
+            Ok(ScanOutput { entries, errors }) => {
                 let index = done
                     .select
                     .as_deref()
@@ -156,6 +200,10 @@ impl App {
                 self.current = done.dir;
                 self.entries = entries;
                 self.state.select(index);
+                self.error_state
+                    .select(if errors.list.is_empty() { None } else { Some(0) });
+                self.errors = errors;
+                self.show_errors = false;
                 self.last_scan = Some(done.elapsed);
                 self.status = None;
             }

@@ -59,7 +59,21 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> io::
                 if key.kind != KeyEventKind::Press {
                     continue;
                 }
+                // 오류 팝업이 열려 있으면 팝업이 키를 모두 가져간다
+                if app.show_errors {
+                    match key.code {
+                        KeyCode::Char('e') | KeyCode::Char('q') | KeyCode::Esc => {
+                            app.show_errors = false
+                        }
+                        KeyCode::Up | KeyCode::Char('k') => app.error_previous(),
+                        KeyCode::Down | KeyCode::Char('j') => app.error_next(),
+                        _ => {}
+                    }
+                    continue;
+                }
                 match key.code {
+                    KeyCode::Char('e') => app.toggle_errors(),
+                    KeyCode::Char('r') => app.rescan(),
                     KeyCode::Char('q') | KeyCode::Esc => app.should_quit = true,
                     KeyCode::Up | KeyCode::Char('k') => app.previous(),
                     KeyCode::Down | KeyCode::Char('j') => app.next(),

@@ -1,8 +1,8 @@
 use ratatui::{
-    layout::{Constraint, Layout},
+    layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, Paragraph},
+    widgets::{Block, Borders, Clear, List, ListItem, Paragraph},
     Frame,
 };
 
@@ -31,15 +31,25 @@ pub fn draw(f: &mut Frame, app: &mut App) {
                 .last_scan
                 .map(|d| format!(" · 스캔 {:.2}초", d.as_secs_f64()))
                 .unwrap_or_default();
+            // 읽지 못한 경로가 있으면 합계는 실제보다 작을 수 있다
+            let at_least = if app.errors.total > 0 { "≥ " } else { "" };
             format!(
-                " {}   (합계: {}{})",
+                " {}   (합계: {}{}{})",
                 app.current.display(),
+                at_least,
                 human(app.total_size()),
                 took
             )
         }
     };
-    let header = Paragraph::new(header_text)
+    let mut header_spans = vec![Span::raw(header_text)];
+    if app.scanning.is_none() && app.errors.total > 0 {
+        header_spans.push(Span::styled(
+            format!("   ⚠ 읽지 못한 경로 {}건 (e)", app.errors.total),
+            Style::default().fg(Color::Yellow),
+        ));
+    }
+    let header = Paragraph::new(Line::from(header_spans))
         .block(Block::default().borders(Borders::ALL).title(" mac-du "));
     f.render_widget(header, chunks[0]);
 
@@ -67,6 +77,15 @@ pub fn draw(f: &mut Frame, app: &mut App) {
                 ),
                 Span::styled(bar, Style::default().fg(Color::Cyan)),
                 Span::raw(format!(" {} {}", icon, e.name)),
+                // 읽지 못한 부분이 있으면 크기가 실제보다 작다는 표시
+                Span::styled(
+                    if e.unreadable > 0 {
+                        format!("  ⚠ 읽지 못함 {}", e.unreadable)
+                    } else {
+                        String::new()
+                    },
+                    Style::default().fg(Color::Yellow),
+                ),
             ]))
         })
         .collect();
@@ -80,10 +99,91 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     // 푸터: 오류 메시지가 있으면 그것을, 없으면 키 도움말
     let footer = match &app.status {
         Some(msg) => Paragraph::new(format!(" ⚠ {}", msg)).style(Style::default().fg(Color::Red)),
-        None => Paragraph::new(" j/k: 이동   l/Enter: 들어가기   h/Backspace: 상위   q/Esc: 종료")
-            .style(Style::default().fg(Color::DarkGray)),
+        None => {
+            let errors_hint = if app.errors.total > 0 { "   e: 오류 목록" } else { "" };
+            Paragraph::new(format!(
+                " j/k: 이동   l/Enter: 들어가기   h/Backspace: 상위   r: 다시 스캔{}   q/Esc: 종료",
+                errors_hint
+            ))
+            .style(Style::default().fg(Color::DarkGray))
+        }
     };
     f.render_widget(footer, chunks[2]);
+
+    if app.show_errors {
+        draw_errors(f, app);
+    }
+}
+
+/// 읽지 못한 경로 목록을 화면 가운데 팝업으로 보여 준다.
+fn draw_errors(f: &mut Frame, app: &mut App) {
+    let area = centered(f.area(), 90, 70);
+    f.render_widget(Clear, area);
+
+    let shown = app.errors.list.len();
+    let title = if app.errors.total > shown {
+        format!(
+            " 읽지 못한 경로 {}건 (앞 {}건만 표시) — j/k 이동, Esc 닫기 ",
+            app.errors.total, shown
+        )
+    } else {
+        format!(
+            " 읽지 못한 경로 {}건 — j/k 이동, Esc 닫기 ",
+            app.errors.total
+        )
+    };
+
+    let items: Vec<ListItem> = app
+        .errors
+        .list
+        .iter()
+        .map(|e| {
+            ListItem::new(Line::from(vec![
+                Span::styled(
+                    format!("[{}] ", describe_errno(e.errno)),
+                    Style::default().fg(Color::Red),
+                ),
+                Span::raw(e.path.display().to_string()),
+            ]))
+        })
+        .collect();
+
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(title)
+                .title_bottom(" 허용 안 됨: 터미널에 '전체 디스크 접근 권한'이 필요할 수 있습니다 "),
+        )
+        .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
+        .highlight_symbol("> ");
+    f.render_stateful_widget(list, area, &mut app.error_state);
+}
+
+fn describe_errno(errno: i32) -> String {
+    match errno {
+        1 => "허용 안 됨".into(),
+        2 => "사라짐".into(),
+        13 => "권한 없음".into(),
+        0 => "알 수 없음".into(),
+        n => format!("오류 {}", n),
+    }
+}
+
+/// `area` 안에서 가로 `pct_x`%, 세로 `pct_y`% 크기의 가운데 영역
+fn centered(area: Rect, pct_x: u16, pct_y: u16) -> Rect {
+    let vertical = Layout::vertical([
+        Constraint::Percentage((100 - pct_y) / 2),
+        Constraint::Percentage(pct_y),
+        Constraint::Percentage((100 - pct_y) / 2),
+    ])
+    .split(area);
+    Layout::horizontal([
+        Constraint::Percentage((100 - pct_x) / 2),
+        Constraint::Percentage(pct_x),
+        Constraint::Percentage((100 - pct_x) / 2),
+    ])
+    .split(vertical[1])[1]
 }
 
 /// 바이트를 사람이 읽기 좋은 단위로 바꾼다.
