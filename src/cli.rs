@@ -6,19 +6,24 @@ pub const HELP: &str = "\
 mac-du - macOS 디스크 사용량 TUI
 
 사용법:
-    mac-du [옵션]
+    mac-du [옵션] [경로]
+
+경로:
+    스캔할 폴더. 생략하면 현재 폴더입니다.
 
 옵션:
     -j, --threads <N>    스캔에 쓸 스레드 수 (1 이상).
                          기본값은 min(CPU 코어 수, 16)입니다.
-                         코어 수보다 크게 지정하면 스캔이 수 초씩 멈출 수 있습니다.
-    -r, --root <DIR>     DIR 전체를 미리 스캔해 두고, 화면은 현재 폴더에서 시작합니다.
-                         DIR 아래에서는 어느 폴더로 오가도 다시 스캔하지 않습니다.
-                         시작 시 DIR 전체를 읽으므로 넓은 경로일수록 오래 걸리고 메모리를 씁니다.
-                         현재 폴더가 DIR 밖이면 DIR에서 시작합니다.
-    -w, --watch <SEC>    시작하자마자 감시 모드를 켜고 SEC초마다 현재 폴더를 다시 스캔
-                         (2 이상, 상한 없음). 큰 폴더라 스캔이 오래 걸리면 간격이 자동으로 늘어납니다.
-                         앱 안에서는 w 키로 켜고 끄고, +/- 키로 간격을 바꿉니다.
+                         코어 수보다 크게 지정하면 느려집니다. 16코어 기기에서는
+                         20스레드부터 스캔이 5~7초씩 멈췄습니다.
+    -r, --root <DIR>     DIR 전체를 먼저 스캔해 두고, 화면은 시작 폴더(경로 인자 또는
+                         현재 폴더)에서 시작합니다. DIR 아래에서는 어느 폴더로 오가도
+                         다시 스캔하지 않습니다. DIR이 넓을수록 첫 스캔 시간과 메모리
+                         사용량이 늘어납니다. 시작 폴더가 DIR 밖이면 DIR에서 시작합니다.
+    -w, --watch <SEC>    시작할 때부터 감시 모드를 켜고 SEC초마다 현재 폴더를 다시 스캔
+                         (2 이상, 상한 없음). 마지막 스캔에 걸린 시간의 2배보다 짧은
+                         간격으로는 돌지 않습니다. 앱 안에서는 w 키로 켜고 끄고,
+                         +/- 키로 간격을 바꿉니다.
     -h, --help           이 도움말을 출력하고 종료
 
 환경 변수:
@@ -27,6 +32,8 @@ mac-du - macOS 디스크 사용량 TUI
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Options {
+    /// 스캔을 시작할 폴더. 없으면 현재 폴더.
+    pub path: Option<PathBuf>,
     /// 사용자가 명시한 스레드 수 (없으면 기본값 사용)
     pub threads: Option<usize>,
     /// 시작할 때 켜 둘 감시 모드의 간격(초). 없으면 꺼 둔 채로 시작한다.
@@ -75,11 +82,26 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Parsed, String> 
             s if s.starts_with("--root=") => {
                 opts.root = Some(parse_root(&s["--root=".len()..])?);
             }
+            // `--` 뒤는 전부 경로로 본다 (`-`로 시작하는 폴더 이름용)
+            "--" => {
+                for rest in args.by_ref() {
+                    set_path(&mut opts, rest)?;
+                }
+            }
+            s if !s.starts_with('-') => set_path(&mut opts, arg)?,
             _ => return Err(format!("알 수 없는 옵션: {arg}")),
         }
     }
 
     Ok(Parsed::Run(opts))
+}
+
+fn set_path(opts: &mut Options, value: String) -> Result<(), String> {
+    if opts.path.is_some() {
+        return Err("경로는 하나만 지정할 수 있습니다".into());
+    }
+    opts.path = Some(PathBuf::from(value));
+    Ok(())
 }
 
 fn parse_threads(value: &str) -> Result<usize, String> {
@@ -145,6 +167,41 @@ mod tests {
             ..Options::default()
         }));
         assert_eq!(parse_strs(&["-j", "4", "-w", "5"]), want);
+    }
+
+    #[test]
+    fn a_start_path_can_be_given_with_or_without_options() {
+        let want = |path: &str| {
+            Ok(Parsed::Run(Options {
+                path: Some(PathBuf::from(path)),
+                ..Options::default()
+            }))
+        };
+        assert_eq!(parse_strs(&["/Users/me/Downloads"]), want("/Users/me/Downloads"));
+        assert_eq!(parse_strs(&["."]), want("."));
+        // 옵션과 섞어 써도, 순서가 달라도 된다
+        let with_threads = Ok(Parsed::Run(Options {
+            path: Some(PathBuf::from("dir")),
+            threads: Some(4),
+            ..Options::default()
+        }));
+        assert_eq!(parse_strs(&["-j", "4", "dir"]), with_threads);
+        assert_eq!(parse_strs(&["dir", "-j", "4"]), with_threads);
+        // `--`로 `-`로 시작하는 폴더 이름도 쓸 수 있다
+        assert_eq!(parse_strs(&["--", "-odd"]), want("-odd"));
+    }
+
+    #[test]
+    fn only_one_start_path_is_allowed() {
+        assert!(parse_strs(&["a", "b"]).is_err());
+        assert!(parse_strs(&["a", "--", "b"]).is_err());
+        assert!(parse_strs(&["--", "a", "b"]).is_err());
+        // 값이 필요한 옵션 뒤의 값은 경로로 세지 않는다
+        assert!(parse_strs(&["-r", "root", "dir"]).is_ok());
+        assert!(parse_strs(&["-r", "root", "dir", "other"]).is_err());
+        // 모르는 옵션은 여전히 오류
+        assert!(parse_strs(&["-x"]).is_err());
+        assert!(parse_strs(&["-"]).is_err());
     }
 
     #[test]

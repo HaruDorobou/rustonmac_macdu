@@ -4,6 +4,7 @@ mod scanner;
 mod ui;
 
 use std::io::{self, Stdout};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
@@ -31,22 +32,17 @@ fn main() -> io::Result<()> {
 
     // App::new가 곧바로 스캔을 시작하므로, 그보다 먼저 스레드 풀을 설정해야 한다
     scanner::init_thread_pool(opts.threads);
-    let start = std::env::current_dir()?;
-    let mut app = match opts.root {
-        // 경로 비교가 어긋나지 않도록 심볼릭 링크를 풀어 둘 다 실제 경로로 맞춘다
-        Some(root) => match root.canonicalize() {
-            Ok(root) if root.is_dir() => {
-                App::with_root(start.canonicalize().unwrap_or(start), root)
-            }
-            Ok(root) => {
-                eprintln!("mac-du: --root는 폴더여야 합니다: {}", root.display());
-                std::process::exit(2);
-            }
-            Err(e) => {
-                eprintln!("mac-du: --root 경로를 열 수 없습니다: {} ({e})", root.display());
-                std::process::exit(2);
-            }
-        },
+    // 경로를 준 경우는 `.`, `..`, 상대 경로, 심볼릭 링크를 풀어 실제 경로로 바꾼다.
+    // 안 준 경우는 현재 폴더를 그대로 쓴다.
+    let start = match &opts.path {
+        Some(path) => resolve_dir(path, "경로"),
+        None => std::env::current_dir()?,
+    };
+    let mut app = match &opts.root {
+        // 경로 비교가 어긋나지 않도록 둘 다 실제 경로로 맞춘다
+        Some(root) => {
+            App::with_root(start.canonicalize().unwrap_or(start), resolve_dir(root, "--root 경로"))
+        }
         None => App::new(start),
     };
     if let Some(secs) = opts.watch {
@@ -66,6 +62,21 @@ fn main() -> io::Result<()> {
     terminal.show_cursor()?;
 
     result
+}
+
+/// 폴더 경로를 실제 경로로 바꾼다. 없거나 폴더가 아니면 터미널을 건드리기 전에 오류로 끝낸다.
+fn resolve_dir(path: &Path, label: &str) -> PathBuf {
+    match path.canonicalize() {
+        Ok(p) if p.is_dir() => p,
+        Ok(p) => {
+            eprintln!("mac-du: {label}는 폴더여야 합니다: {}", p.display());
+            std::process::exit(2);
+        }
+        Err(e) => {
+            eprintln!("mac-du: {label}를 열 수 없습니다: {} ({e})", path.display());
+            std::process::exit(2);
+        }
+    }
 }
 
 fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> io::Result<()> {
