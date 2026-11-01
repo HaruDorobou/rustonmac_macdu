@@ -182,7 +182,10 @@ pub struct App {
     /// 스피너 애니메이션용 프레임 카운터
     pub tick: usize,
     /// 가장 최근에 끝난 스캔의 소요 시간
-    pub last_scan: Option<Duration>,
+    /// 가장 최근에 끝난 "이 폴더 아래를 다시 읽는" 스캔(`r`, 감시)의 폴더와 소요 시간.
+    /// 감시 간격을 늘릴지 정하는 근거다. 처음 읽거나 범위를 넓히는 스캔은 디스크 캐시가
+    /// 차갑고 읽는 범위도 달라서 감시 때의 재스캔 시간을 대표하지 못하므로 넣지 않는다.
+    pub watch_scan: Option<(PathBuf, Duration)>,
     /// 트리 전체에서 읽지 못한 경로들
     errors: ErrorReport,
     /// 현재 폴더 하위의 읽지 못한 경로들 (팝업에 보여 줄 목록)
@@ -259,7 +262,7 @@ impl App {
             expand_candidates: Vec::new(),
             expand_state: ListState::default(),
             tick: 0,
-            last_scan: None,
+            watch_scan: None,
             errors: ErrorReport::default(),
             error_view: Vec::new(),
             show_errors: false,
@@ -576,7 +579,11 @@ impl App {
     /// 마지막 스캔 시간의 2배까지 간격을 늘린다.
     pub fn watch_effective(&self) -> Option<Duration> {
         let w = self.watch.as_ref()?;
-        let took = self.last_scan.map_or(Duration::ZERO, |d| d * 2);
+        // 지금 보는 폴더를 실제로 다시 읽어 본 적이 있을 때만 그 시간으로 늘린다
+        let took = match &self.watch_scan {
+            Some((dir, d)) if *dir == self.current => *d * 2,
+            _ => Duration::ZERO,
+        };
         Some(Duration::from_secs(w.secs).max(took))
     }
 
@@ -928,6 +935,7 @@ impl App {
             }
         };
         self.status = None;
+        let rescan_of = matches!(done.target, Target::Subtree).then(|| done.dir.clone());
 
         match done.target {
             Target::NewRoot { select, open } => {
@@ -1016,7 +1024,9 @@ impl App {
         }
 
         self.apply_sort();
-        self.last_scan = Some(done.elapsed);
+        if let Some(dir) = rescan_of {
+            self.watch_scan = Some((dir, done.elapsed));
+        }
         self.last_checked = Some(Instant::now());
         self.scan_durations.push((done.stamp, done.elapsed));
         // 오래된 기록은 버린다. 화면에 남아 있는 데이터가 참조하는 스캔은 최근 것들뿐이다.
@@ -1574,6 +1584,41 @@ mod tests {
     }
 
     #[test]
+    fn going_up_does_not_stretch_the_watch_interval_until_the_folder_is_rescanned() {
+        let root = temp_root("watch-up");
+        fs::create_dir_all(root.join("x")).unwrap();
+        fs::create_dir_all(root.join("y")).unwrap();
+        fs::write(root.join("x/f"), vec![1u8; 1_000]).unwrap();
+        fs::write(root.join("y/f"), vec![1u8; 1_000]).unwrap();
+
+        let (mut app, _) = app_with_clock(&root.join("x"), &root.join("x"), 1000);
+        wait(&mut app);
+        app.enable_watch(5);
+        // 위로 올라가며 범위를 넓히는 스캔이 아무리 오래 걸렸어도 간격은 그대로다
+        app.back();
+        wait(&mut app);
+        assert_eq!(app.current, root);
+        let expand_took = app.scan_durations.last().unwrap().1;
+        assert!(app.watch_scan.is_none(), "an expand scan says nothing about a watch rescan");
+        assert_eq!(app.watch_effective(), Some(Duration::from_secs(5)), "after {expand_took:?}");
+
+        // 이 폴더를 다시 읽고 나면 그 시간이 근거가 된다
+        app.rescan();
+        wait(&mut app);
+        assert!(matches!(&app.watch_scan, Some((dir, _)) if *dir == root));
+
+        // 폴더를 옮기면 그 폴더를 읽어 본 적이 없으므로 다시 원래 간격이다
+        app.watch_scan = Some((root.clone(), Duration::from_secs(60)));
+        assert_eq!(app.watch_effective(), Some(Duration::from_secs(120)));
+        let x = names(&app).iter().position(|n| n == "x").unwrap();
+        app.state.select(Some(x));
+        app.enter();
+        assert_eq!(app.watch_effective(), Some(Duration::from_secs(5)));
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
     fn jumping_stops_at_both_ends_and_tolerates_empty_lists() {
         assert_eq!(jumped(Some(3), 10, Jump::Top), Some(0));
         assert_eq!(jumped(Some(3), 10, Jump::Bottom), Some(9));
@@ -1983,9 +2028,12 @@ mod tests {
         wait(&mut app);
 
         // 간격 < 마지막 스캔 시간 × 2 이면 실제 간격이 늘어난다
-        app.last_scan = Some(Duration::from_secs(10));
+        app.watch_scan = Some((app.current.clone(), Duration::from_secs(10)));
         assert_eq!(app.watch_effective(), Some(Duration::from_secs(20)));
-        app.last_scan = Some(Duration::from_millis(100));
+        // 다른 폴더를 읽은 시간은 지금 폴더의 감시 간격에 영향을 주지 않는다
+        app.watch_scan = Some((PathBuf::from("/somewhere/else"), Duration::from_secs(10)));
+        assert_eq!(app.watch_effective(), Some(Duration::from_secs(app.watch.as_ref().unwrap().secs)));
+        app.watch_scan = Some((app.current.clone(), Duration::from_millis(100)));
         assert_eq!(app.watch_effective(), Some(Duration::from_secs(MIN_WATCH_SECS)));
 
         // 간격 조절과 껐다 켜기
