@@ -40,6 +40,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     if app.show_help {
         draw_help(f);
     }
+    if let Some(msg) = &app.warning {
+        draw_warning(f, msg);
+    }
 }
 
 /// 모든 키를 보여 주는 팝업. 푸터는 폭이 좁으면 항목을 줄이므로, 빠짐없는 목록은 여기에 둔다.
@@ -68,6 +71,37 @@ const HELP_TEXT: &[(&str, &str)] = &[
     ("?", "이 도움말 열기/닫기"),
     ("q  Esc", "종료 (팝업에서는 닫기)"),
 ];
+
+/// 확인해야 넘어가는 경고 팝업
+fn draw_warning(f: &mut Frame, msg: &str) {
+    let screen = f.area();
+    let width = 66.min(screen.width);
+    // 줄 바꿈은 Paragraph가 하므로, 안쪽 폭 기준으로 줄 수를 어림잡아 높이를 정한다
+    let inner = width.saturating_sub(4).max(1) as usize;
+    let rows: usize = msg
+        .lines()
+        .map(|l| (Span::raw(l.to_string()).width().max(1) + inner - 1) / inner)
+        .sum();
+    let height = (rows as u16 + 2).min(screen.height);
+    let area = Rect {
+        x: screen.x + (screen.width - width) / 2,
+        y: screen.y + (screen.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
+    f.render_widget(Clear, area);
+    let warn = Style::default().fg(Color::Yellow);
+    let body = Paragraph::new(msg.to_string())
+        .wrap(ratatui::widgets::Wrap { trim: false })
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(warn)
+                .title(Span::styled(" ⚠ 경고 ", warn.add_modifier(Modifier::BOLD)))
+                .title_bottom(" Enter 확인 "),
+        );
+    f.render_widget(body, area);
+}
 
 fn draw_help(f: &mut Frame) {
     let screen = f.area();
@@ -328,8 +362,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     let footer = if let Some(msg) = &app.status {
         Paragraph::new(format!(" ⚠ {}", msg)).style(Style::default().fg(Color::Red))
     } else if let Some(msg) = app.notice() {
-        let color = if msg.starts_with('⚠') { Color::Yellow } else { Color::Green };
-        Paragraph::new(format!(" {}", msg)).style(Style::default().fg(color))
+        Paragraph::new(format!(" {}", msg)).style(Style::default().fg(Color::Green))
     } else {
         let items = help_items(app.watch.is_some(), app.unreadable_here() > 0);
         Paragraph::new(help_line(&items, area.width as usize))
@@ -598,6 +631,25 @@ mod tests {
         let wide = help_line(&help_items(true, true), 200);
         for all in ["p 위쪽", "w 감시", "+/- 간격", "y/Y 복사", "e 오류"] {
             assert!(wide.contains(all), "{all:?} missing: {wide:?}");
+        }
+    }
+
+    #[test]
+    fn the_warning_popup_shows_its_text_and_fits_a_small_terminal() {
+        use ratatui::{backend::TestBackend, Terminal};
+        for (w, h) in [(100, 30), (60, 14), (40, 8)] {
+            let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+            t.draw(|f| draw_warning(f, "넓은 폴더를 감시하고 있습니다.\n\n  /\n\n끄려면 w를 누르세요.")).unwrap();
+            let text: String = t
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|c| c.symbol())
+                .collect();
+            // 한글은 전각이라 버퍼에서 칸이 나뉘므로 ASCII 부분으로 확인한다
+            assert!(text.contains('⚠'), "{w}x{h}: title missing");
+            assert!(text.contains("Enter") || h < 10, "{w}x{h}: footer missing");
         }
     }
 

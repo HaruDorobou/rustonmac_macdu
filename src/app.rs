@@ -22,8 +22,6 @@ const WATCH_STEPS: [u64; 12] = [2, 3, 5, 10, 15, 30, 60, 120, 300, 600, 1800, 36
 const CHANGE_VISIBLE: Duration = Duration::from_secs(30);
 /// "복사됨" 같은 알림을 푸터에 남겨 두는 시간
 const NOTICE_VISIBLE: Duration = Duration::from_secs(3);
-/// 경고(`⚠`로 시작하는 알림)는 읽을 시간이 더 필요하다
-const WARNING_VISIBLE: Duration = Duration::from_secs(8);
 /// 이 깊이 이하의 폴더(`/`는 0, `/Users`는 1, `/Users/이름`은 2)를 감시하면 경고한다
 const WIDE_WATCH_DEPTH: usize = 2;
 
@@ -165,6 +163,8 @@ pub struct App {
     /// 오류 목록 팝업이 열려 있는지
     pub show_errors: bool,
     pub error_state: ListState,
+    /// 경고 팝업의 내용. 있으면 팝업이 열려 있고, 확인할 때까지 다른 키를 받지 않는다.
+    pub warning: Option<String>,
     /// 키 도움말 팝업이 열려 있는지
     pub show_help: bool,
     /// 지금 가장 위에 보이는 목록이 한 화면에 보여 주는 줄 수. 그릴 때마다 갱신된다.
@@ -230,6 +230,7 @@ impl App {
             show_errors: false,
             error_state: ListState::default(),
             show_help: false,
+            warning: None,
             page_rows: 10,
             watch: None,
             last_watch_secs: DEFAULT_WATCH_SECS,
@@ -393,12 +394,10 @@ impl App {
             .filter(|c| matches!(c, std::path::Component::Normal(_)))
             .count();
         if depth <= WIDE_WATCH_DEPTH {
-            self.notice = Some((
-                format!(
-                    "⚠ 넓은 폴더({})를 감시합니다: 간격마다 아래 전체를 다시 읽어 디스크와 CPU를 많이 씁니다",
-                    self.current.display()
-                ),
-                Instant::now(),
+            self.warning = Some(format!(
+                "넓은 폴더를 감시하고 있습니다.\n\n  {}\n\n감시는 {}초마다 이 폴더 아래 전체를 다시 읽습니다.\n스캔이 오래 걸리는 폴더면 디스크와 CPU를 계속 많이 씁니다.\n끄려면 w를 누르세요.",
+                self.current.display(),
+                self.watch.as_ref().map_or(0, |w| w.secs),
             ));
         }
     }
@@ -596,10 +595,7 @@ impl App {
     pub fn notice(&self) -> Option<&str> {
         self.notice
             .as_ref()
-            .filter(|(msg, at)| {
-                let limit = if msg.starts_with('⚠') { WARNING_VISIBLE } else { NOTICE_VISIBLE };
-                at.elapsed() < limit
-            })
+            .filter(|(_, at)| at.elapsed() < NOTICE_VISIBLE)
             .map(|(msg, _)| msg.as_str())
     }
 
@@ -1277,23 +1273,23 @@ mod tests {
         // 임시 폴더는 깊은 경로이므로 경고가 없다
         app.toggle_watch();
         assert!(app.watch.is_some());
-        assert_eq!(app.notice(), None);
+        assert_eq!(app.warning, None);
         app.toggle_watch();
 
         // 깊이 0, 1, 2는 경고하고, 3부터는 하지 않는다
         for (path, warns) in [("/", true), ("/Users", true), ("/Users/me", true), ("/Users/me/work", false)] {
             app.watch = None;
-            app.notice = None;
+            app.warning = None;
             app.current = PathBuf::from(path);
             app.toggle_watch();
             assert!(app.watch.is_some(), "{path}: the warning does not stop the watch");
-            assert_eq!(app.notice().is_some_and(|m| m.starts_with('⚠')), warns, "{path}");
+            assert_eq!(app.warning.is_some(), warns, "{path}");
         }
         // 간격만 바꿀 때는 다시 경고하지 않는다
-        app.notice = None;
+        app.warning = None;
         app.current = PathBuf::from("/");
         app.adjust_watch(true);
-        assert_eq!(app.notice(), None);
+        assert_eq!(app.warning, None);
 
         fs::remove_dir_all(&root).unwrap();
     }

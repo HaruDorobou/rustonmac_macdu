@@ -126,6 +126,16 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> io::
                     continue;
                 }
                 let jump = jump_for(&key, &mut pending_g, app.page_rows);
+                // 경고 팝업은 확인할 때까지 다른 키를 받지 않는다
+                if app.warning.is_some() {
+                    if matches!(
+                        key.code,
+                        KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char(' ')
+                    ) {
+                        app.warning = None;
+                    }
+                    continue;
+                }
                 // 도움말 팝업이 열려 있으면 닫는 키만 받는다
                 if app.show_help {
                     if matches!(
