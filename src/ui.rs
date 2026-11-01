@@ -37,6 +37,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     if app.show_expand {
         draw_expand(f, app);
     }
+    if app.find.is_some() {
+        draw_find(f, app);
+    }
     if app.show_help {
         draw_help(f);
     }
@@ -62,6 +65,7 @@ const HELP_TEXT: &[(&str, &str)] = &[
     ("w  + -", "감시 켜기/끄기, 간격 조절"),
     ("e", "읽지 못한 경로 목록"),
     ("보기", ""),
+    ("f", "찾기: 이름이 일치하는 항목 / 가장 큰 파일"),
     ("S", "정렬 순환: 크기 큰 순 / 이름순 / 크기 작은 순"),
     ("u", "단위 순환: 자동 K M G T"),
     ("s", "기준 전환: 1024 / 1000"),
@@ -73,6 +77,105 @@ const HELP_TEXT: &[(&str, &str)] = &[
     ("?", "이 도움말 열기/닫기"),
     ("q  Esc", "종료 (팝업에서는 닫기)"),
 ];
+
+/// 찾기 화면: 지금 보는 폴더 아래에서 이름이 일치하는 항목, 또는 가장 큰 항목
+fn draw_find(f: &mut Frame, app: &mut App) {
+    let area = centered(f.area(), 94, 88);
+    f.render_widget(Clear, area);
+
+    // 아래에서 App을 빌려 쓰므로 필요한 값을 먼저 꺼내 둔다
+    let units = app.units;
+    let scope_total = app.total_size().max(1);
+    let at_least = if app.unreadable_here() > 0 { "≥ " } else { "" };
+    let scope = app.current.display().to_string();
+    let Some(v) = app.find.as_ref() else { return };
+    let (query, kind, typing) = (v.query.clone(), v.kind, v.typing);
+    let (count, total, nested) = (v.found.count, v.found.total, v.found.nested);
+    let shown = v.found.hits.len();
+    let mut state = v.state.clone();
+
+    let size_w = v
+        .found
+        .hits
+        .iter()
+        .map(|h| units.format(h.size).chars().count())
+        .max()
+        .unwrap_or(0)
+        .max(10);
+    let dim = Style::default().fg(Color::DarkGray);
+    let items: Vec<ListItem> = v
+        .found
+        .hits
+        .iter()
+        .map(|h| {
+            let pct = h.size as f64 / scope_total as f64 * 100.0;
+            let icon = if h.is_dir { "📁" } else { "📄" };
+            let mut spans = vec![
+                Span::styled(
+                    format!("{:>w$} ", units.format(h.size), w = size_w),
+                    Style::default().fg(Color::Yellow),
+                ),
+                Span::styled(format!("{:>5.1}% ", pct), dim),
+                Span::raw(format!("{icon} {}", app.find_hit_path(h))),
+            ];
+            if h.nested {
+                spans.push(Span::styled("  ↳ 위 항목에 포함", dim));
+            }
+            ListItem::new(Line::from(spans))
+        })
+        .collect();
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(" 찾기 — {scope} "))
+        .title_bottom(if typing {
+            " 글자 입력 · Tab 종류 · Enter/Esc 목록으로 "
+        } else {
+            " j/k 이동 · Enter 그 위치로 · / 이름 입력 · Tab 종류 · Esc 닫기 "
+        });
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let rows = Layout::vertical([Constraint::Length(2), Constraint::Min(0)]).split(inner);
+
+    // 첫 줄: 검색어와 종류, 둘째 줄: 건수와 합계
+    let cursor = if typing { "█" } else { "" };
+    let first = if query.is_empty() && !typing {
+        Line::from(vec![
+            Span::raw(format!(" [{}] ", kind.label())),
+            Span::styled("이름 일부를 치려면 /  (비워 두면 가장 큰 항목 순)", dim),
+        ])
+    } else {
+        Line::from(vec![
+            Span::raw(format!(" [{}] 이름: ", kind.label())),
+            Span::styled(
+                format!("{query}{cursor}"),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+        ])
+    };
+    let second = if count == 0 {
+        Line::from(Span::styled(" 일치하는 항목이 없습니다", Style::default().fg(Color::Red)))
+    } else {
+        let mut text = format!(" {count}건 · 합계 {at_least}{}", units.format(total));
+        if nested > 0 {
+            text.push_str(&format!(" (다른 일치 항목 안에 든 {nested}건은 더하지 않음)"));
+        }
+        if count > shown {
+            text.push_str(&format!(" · 큰 {shown}건만 표시"));
+        }
+        Line::from(Span::styled(text, dim))
+    };
+    f.render_widget(Paragraph::new(vec![first, second]), rows[0]);
+
+    app.page_rows = rows[1].height as usize;
+    let list = List::new(items)
+        .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
+        .highlight_symbol("> ");
+    f.render_stateful_widget(list, rows[1], &mut state);
+    if let Some(v) = app.find.as_mut() {
+        v.state = state;
+    }
+}
 
 /// 확인해야 넘어가는 경고 팝업
 fn draw_warning(f: &mut Frame, msg: &str) {
@@ -393,6 +496,7 @@ fn help_items(watching: bool, has_errors: bool) -> Vec<(u8, String)> {
         (2, "? 도움말".to_string()),
         (3, "r 갱신".to_string()),
         (5, "/ 검색".to_string()),
+        (4, "f 찾기".to_string()),
         (6, "p 위쪽".to_string()),
         (5, "w 감시".to_string()),
     ];
@@ -664,6 +768,35 @@ mod tests {
             assert!(text.contains('⚠'), "{w}x{h}: title missing");
             assert!(text.contains("Enter") || h < 10, "{w}x{h}: footer missing");
         }
+    }
+
+    #[test]
+    fn the_find_popup_draws_on_small_and_large_terminals() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let root = std::env::temp_dir().join(format!("mac-du-ui-find-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("a")).unwrap();
+        std::fs::write(root.join("a/f.txt"), vec![1u8; 10_000]).unwrap();
+        let mut app = App::new(root.clone());
+        for _ in 0..500 {
+            app.poll_scan();
+            if app.scanning.is_none() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        app.open_find();
+        for (w, h) in [(120, 40), (80, 24), (40, 10)] {
+            let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+            t.draw(|f| draw(f, &mut app)).unwrap();
+            let text: String = t.backend().buffer().content().iter().map(|c| c.symbol()).collect();
+            assert!(text.contains("f.txt") || w < 60, "{w}x{h}: the biggest file should be listed");
+        }
+        app.find_set_typing(true);
+        app.find_edit(|q| q.push_str("zzz"));
+        let mut t = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        t.draw(|f| draw(f, &mut app)).unwrap();
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

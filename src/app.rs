@@ -9,6 +9,7 @@ use ratatui::widgets::ListState;
 
 use crate::clipboard;
 use crate::finder;
+use crate::find::{self, Found, Kind};
 use crate::scanner::{self, ErrorReport, Node, ScanError, ScanOutput};
 use crate::units::{self, Units};
 
@@ -104,6 +105,21 @@ struct Changes {
     map: HashMap<String, Change>,
 }
 
+/// 찾기 화면에 보여 주는 최대 건수. 건수와 합계는 이보다 많아도 전부 센다.
+pub const FIND_LIMIT: usize = 500;
+
+/// 찾기 화면의 상태: 지금 보는 폴더 아래에서 이름이 일치하는 항목, 또는 가장 큰 항목
+pub struct FindView {
+    pub query: String,
+    pub kind: Kind,
+    /// 사용자가 `Tab`으로 종류를 직접 골랐는가. 그러면 검색어가 바뀌어도 종류를 건드리지 않는다.
+    kind_manual: bool,
+    /// 검색어를 입력하는 중인가 (아니면 목록을 탐색하는 중)
+    pub typing: bool,
+    pub found: Found,
+    pub state: ListState,
+}
+
 /// 목록 정렬 순서. 스캔 결과는 항상 크기 큰 순으로 저장되고, 보고 있는 폴더만 이 순서로 다시 늘어놓는다.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SortMode {
@@ -193,6 +209,8 @@ pub struct App {
     /// 오류 목록 팝업이 열려 있는지
     pub show_errors: bool,
     pub error_state: ListState,
+    /// 찾기 화면이 열려 있으면 그 상태
+    pub find: Option<FindView>,
     /// 지금 보고 있는 폴더의 정렬 순서
     pub sort: SortMode,
     /// 검색어를 입력하는 중이면 지금까지 친 글자
@@ -269,6 +287,7 @@ impl App {
             error_state: ListState::default(),
             show_help: false,
             warning: None,
+            find: None,
             sort: SortMode::default(),
             search_input: None,
             search_origin: None,
@@ -367,6 +386,124 @@ impl App {
     pub fn jump(&mut self, jump: Jump) {
         let i = jumped(self.state.selected(), self.children().len(), jump);
         self.state.select(i);
+    }
+
+    // ---- 찾기 (폴더 아래 전체에서 이름으로 / 큰 순서로) -----------------------
+
+    /// `f`: 지금 보는 폴더 아래에서 가장 큰 파일을 보여 주는 찾기 화면을 연다.
+    pub fn open_find(&mut self) {
+        if self.children().is_empty() {
+            return;
+        }
+        self.find = Some(FindView {
+            query: String::new(),
+            kind: Kind::Files,
+            kind_manual: false,
+            typing: false,
+            found: Found::default(),
+            state: ListState::default(),
+        });
+        self.find_refresh();
+        self.show_errors = false;
+    }
+
+    pub fn close_find(&mut self) {
+        self.find = None;
+    }
+
+    /// 검색어와 종류로 결과를 다시 만든다. 선택 위치는 목록 안에 머문다.
+    fn find_refresh(&mut self) {
+        let Some(mut v) = self.find.take() else { return };
+        v.found = find::find(self.current_node(), &v.query, v.kind, FIND_LIMIT);
+        let sel = v.state.selected().unwrap_or(0);
+        v.state.select((!v.found.hits.is_empty()).then(|| sel.min(v.found.hits.len() - 1)));
+        self.find = Some(v);
+    }
+
+    /// 검색어를 입력하는 중인지 바꾼다.
+    pub fn find_set_typing(&mut self, typing: bool) {
+        if let Some(v) = &mut self.find {
+            v.typing = typing;
+        }
+    }
+
+    /// 검색어를 고치고 결과를 맨 위부터 다시 보여 준다. 종류를 직접 고르지 않았다면
+    /// 검색어가 있을 때는 파일+폴더, 비어 있으면 파일만(가장 큰 파일 순위)으로 맞춘다.
+    pub fn find_edit(&mut self, f: impl FnOnce(&mut String)) {
+        let Some(v) = &mut self.find else { return };
+        f(&mut v.query);
+        if !v.kind_manual {
+            v.kind = if v.query.is_empty() { Kind::Files } else { Kind::All };
+        }
+        v.state.select(Some(0));
+        self.find_refresh();
+    }
+
+    /// `Tab`: 찾을 종류를 파일+폴더 → 파일만 → 폴더만으로 바꾼다.
+    pub fn find_cycle_kind(&mut self) {
+        let Some(v) = &mut self.find else { return };
+        v.kind = v.kind.next();
+        v.kind_manual = true;
+        v.state.select(Some(0));
+        self.find_refresh();
+    }
+
+    pub fn find_jump(&mut self, jump: Jump) {
+        if let Some(v) = &mut self.find {
+            let i = jumped(v.state.selected(), v.found.hits.len(), jump);
+            v.state.select(i);
+        }
+    }
+
+    /// 고른 항목이 있는 폴더로 이동해 그 항목에 하이라이트를 둔다.
+    pub fn find_go(&mut self) {
+        let Some(hit) = self
+            .find
+            .as_ref()
+            .and_then(|v| v.state.selected().and_then(|i| v.found.hits.get(i)))
+            .cloned()
+        else {
+            return;
+        };
+        let Some((&last, parents)) = hit.path.split_last() else { return };
+        let mut stack = self.stack.clone();
+        stack.extend(parents.iter().map(|&i| i as usize));
+
+        // 위치 정보는 트리가 바뀔 때마다 새로 만들지만, 틀렸다면 이동하지 않는다
+        let mut node = &self.root;
+        let mut current = self.tree_root.clone();
+        for &i in &stack {
+            let Some(child) = node.children.get(i) else {
+                self.status = Some("트리가 바뀌어 이동하지 못했습니다. 다시 찾아 주세요".into());
+                return;
+            };
+            node = child;
+            current.push(&*node.name);
+        }
+        if last as usize >= node.children.len() {
+            self.status = Some("트리가 바뀌어 이동하지 못했습니다. 다시 찾아 주세요".into());
+            return;
+        }
+        self.stack = stack;
+        self.current = current;
+        self.state.select(Some(last as usize));
+        // 이 폴더의 정렬 순서를 맞추되 하이라이트는 같은 항목에 둔다
+        self.apply_sort();
+        self.status = None;
+        self.show_errors = false;
+        self.find = None;
+    }
+
+    /// 찾기 화면에서 `hit`의 이름 경로 (찾기 시작한 폴더 기준)
+    pub fn find_hit_path(&self, hit: &find::Hit) -> String {
+        let mut node = self.current_node();
+        let mut parts: Vec<&str> = Vec::with_capacity(hit.path.len());
+        for &i in &hit.path {
+            let Some(child) = node.children.get(i as usize) else { break };
+            parts.push(&child.name);
+            node = child;
+        }
+        parts.join("/")
     }
 
     // ---- 검색 -------------------------------------------------------------
@@ -922,6 +1059,8 @@ impl App {
         self.expanding = false;
         self.rx = None;
         self.apply_scan(done);
+        // 트리가 바뀌었으면 찾기 결과의 위치 정보도 새로 만든다
+        self.find_refresh();
         self.schedule_next();
     }
 
@@ -1614,6 +1753,71 @@ mod tests {
         app.state.select(Some(x));
         app.enter();
         assert_eq!(app.watch_effective(), Some(Duration::from_secs(5)));
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn the_find_view_ranks_files_matches_names_and_jumps_to_the_place() {
+        let root = temp_root("find");
+        fs::create_dir_all(root.join("app/node_modules/node_modules")).unwrap();
+        fs::create_dir_all(root.join("docs")).unwrap();
+        fs::write(root.join("app/node_modules/a.js"), vec![1u8; 100_000]).unwrap();
+        fs::write(root.join("app/node_modules/node_modules/b.js"), vec![1u8; 40_000]).unwrap();
+        fs::write(root.join("docs/readme.md"), vec![1u8; 8_000]).unwrap();
+        fs::write(root.join("big.bin"), vec![1u8; 500_000]).unwrap();
+        let mut app = App::new(root.clone());
+        wait(&mut app);
+        app.cycle_sort(); // 이름순으로 두어도 찾아가는 곳이 어긋나지 않아야 한다
+
+        // 비어 있으면 가장 큰 파일 순위
+        app.open_find();
+        let v = app.find.as_ref().unwrap();
+        assert_eq!(v.kind, Kind::Files);
+        assert_eq!(v.found.count, 4);
+        assert_eq!(app.find_hit_path(&v.found.hits[0]), "big.bin");
+        assert_eq!(app.find_hit_path(&v.found.hits[1]), "app/node_modules/a.js");
+
+        // 글자를 치면 파일+폴더로 바뀌고, 안쪽에 또 있는 항목은 합계에서 빠진다
+        for c in "node_modules".chars() {
+            app.find_edit(|q| q.push(c));
+        }
+        let v = app.find.as_ref().unwrap();
+        assert_eq!(v.kind, Kind::All);
+        assert_eq!((v.found.count, v.found.nested), (2, 1));
+        let outer = app.find_hit_path(&v.found.hits[0]);
+        assert_eq!(outer, "app/node_modules");
+        assert!(v.found.hits[1].nested);
+
+        // Tab으로 직접 고른 종류는 검색어를 지워도 유지된다
+        app.find_cycle_kind();
+        assert_eq!(app.find.as_ref().unwrap().kind, Kind::Files);
+        assert_eq!(app.find.as_ref().unwrap().found.count, 0, "no file is named node_modules");
+        for _ in 0.."node_modules".len() {
+            app.find_edit(|q| {
+                q.pop();
+            });
+        }
+        assert_eq!(app.find.as_ref().unwrap().kind, Kind::Files);
+        app.find_cycle_kind(); // 폴더만
+        app.find_cycle_kind(); // 파일+폴더
+
+        // Enter: 그 항목이 있는 폴더로 가서 하이라이트한다
+        for c in "b.js".chars() {
+            app.find_edit(|q| q.push(c));
+        }
+        app.find_go();
+        assert!(app.find.is_none());
+        assert_eq!(app.current, root.join("app/node_modules/node_modules"));
+        assert_eq!(app.selected_name().as_deref(), Some("b.js"));
+        app.back();
+        assert_eq!(app.selected_name().as_deref(), Some("node_modules"));
+
+        // 위치는 지금 보는 폴더 기준이다: 안에서 열면 그 아래만 찾는다
+        assert_eq!(app.current, root.join("app/node_modules"));
+        app.open_find();
+        assert_eq!(app.find.as_ref().unwrap().found.count, 2, "a.js and b.js are under here, big.bin is not");
+        app.close_find();
 
         fs::remove_dir_all(&root).unwrap();
     }

@@ -1,6 +1,7 @@
 mod app;
 mod cli;
 mod clipboard;
+mod find;
 mod finder;
 mod units;
 mod scanner;
@@ -157,6 +158,39 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> io::
                     }
                     continue;
                 }
+                // 찾기 화면: 검색어를 치는 중이면 글자를 받고, 아니면 목록을 탐색한다
+                if app.find.is_some() {
+                    if app.find.as_ref().is_some_and(|v| v.typing) {
+                        match key.code {
+                            KeyCode::Enter | KeyCode::Esc => app.find_set_typing(false),
+                            KeyCode::Tab => app.find_cycle_kind(),
+                            KeyCode::Backspace => app.find_edit(|q| {
+                                q.pop();
+                            }),
+                            KeyCode::Up => app.find_jump(Jump::Up(1)),
+                            KeyCode::Down => app.find_jump(Jump::Down(1)),
+                            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                app.find_edit(|q| q.push(c))
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
+                    if let Some(j) = jump {
+                        app.find_jump(j);
+                        continue;
+                    }
+                    match key.code {
+                        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('f') => app.close_find(),
+                        KeyCode::Char('/') => app.find_set_typing(true),
+                        KeyCode::Tab => app.find_cycle_kind(),
+                        KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => app.find_go(),
+                        KeyCode::Up | KeyCode::Char('k') => app.find_jump(Jump::Up(1)),
+                        KeyCode::Down | KeyCode::Char('j') => app.find_jump(Jump::Down(1)),
+                        _ => {}
+                    }
+                    continue;
+                }
                 // 도움말 팝업이 열려 있으면 닫는 키만 받는다
                 if app.show_help {
                     if matches!(
@@ -205,6 +239,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> io::
                 }
                 match key.code {
                     KeyCode::Char('?') => app.show_help = true,
+                    KeyCode::Char('f') => app.open_find(),
                     KeyCode::Char('S') => app.cycle_sort(),
                     KeyCode::Char('/') => app.start_search(),
                     KeyCode::Char('n') => app.search_next(true),
