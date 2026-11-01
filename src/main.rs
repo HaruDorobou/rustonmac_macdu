@@ -125,6 +125,16 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> io::
                     continue;
                 }
                 let jump = jump_for(&key, &mut pending_g, app.page_rows);
+                // 도움말 팝업이 열려 있으면 닫는 키만 받는다
+                if app.show_help {
+                    if matches!(
+                        key.code,
+                        KeyCode::Char('?') | KeyCode::Char('q') | KeyCode::Esc | KeyCode::Enter
+                    ) {
+                        app.show_help = false;
+                    }
+                    continue;
+                }
                 // 오류 팝업이 열려 있으면 팝업이 키를 모두 가져간다
                 if app.show_errors {
                     if let Some(j) = jump {
@@ -162,6 +172,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> io::
                     continue;
                 }
                 match key.code {
+                    KeyCode::Char('?') => app.show_help = true,
                     KeyCode::Char('p') => app.open_expand(),
                     KeyCode::Char('y') => app.copy_selected(),
                     KeyCode::Char('Y') => app.copy_current(),

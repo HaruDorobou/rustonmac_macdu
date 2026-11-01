@@ -37,6 +37,72 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     if app.show_expand {
         draw_expand(f, app);
     }
+    if app.show_help {
+        draw_help(f);
+    }
+}
+
+/// 모든 키를 보여 주는 팝업. 푸터는 폭이 좁으면 항목을 줄이므로, 빠짐없는 목록은 여기에 둔다.
+const HELP_TEXT: &[(&str, &str)] = &[
+    ("이동", ""),
+    ("j k  ↓ ↑", "위아래로 한 줄"),
+    ("gg  Home", "맨 위 항목"),
+    ("G  End", "맨 아래 항목"),
+    ("Ctrl-d  Ctrl-u", "반 화면 아래/위"),
+    ("PageDown  PageUp", "한 화면 아래/위"),
+    ("l  Enter  →", "폴더 안으로"),
+    ("h  Backspace  ←", "상위 폴더로"),
+    ("스캔", ""),
+    ("r", "지금 폴더 아래를 다시 스캔"),
+    ("p", "위쪽 폴더까지 미리 스캔"),
+    ("w  + -", "감시 켜기/끄기, 간격 조절"),
+    ("e", "읽지 못한 경로 목록"),
+    ("보기", ""),
+    ("u", "단위 순환: 자동 K M G T"),
+    ("s", "기준 전환: 1024 / 1000"),
+    ("i", "정확한 바이트 수"),
+    ("항목", ""),
+    ("y  Y", "경로 복사: 항목 / 지금 폴더"),
+    ("o  O", "Finder: 항목 선택 / 지금 폴더 열기"),
+    ("기타", ""),
+    ("?", "이 도움말 열기/닫기"),
+    ("q  Esc", "종료 (팝업에서는 닫기)"),
+];
+
+fn draw_help(f: &mut Frame) {
+    let screen = f.area();
+    let width = 62.min(screen.width);
+    let height = (HELP_TEXT.len() as u16 + 2).min(screen.height);
+    let area = Rect {
+        x: screen.x + (screen.width - width) / 2,
+        y: screen.y + (screen.height - height) / 2,
+        width,
+        height,
+    };
+    f.render_widget(Clear, area);
+
+    let lines: Vec<Line> = HELP_TEXT
+        .iter()
+        .map(|(key, what)| {
+            if what.is_empty() {
+                Line::from(Span::styled(
+                    format!(" {key}"),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ))
+            } else {
+                Line::from(vec![
+                    Span::styled(format!("   {key:<18}"), Style::default().fg(Color::Yellow)),
+                    Span::raw(*what),
+                ])
+            }
+        })
+        .collect();
+    let help = Paragraph::new(lines).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" 키 도움말  ? / Esc 닫기 "),
+    );
+    f.render_widget(help, area);
 }
 
 /// 어느 상위 폴더까지 미리 스캔해 둘지 고르는 팝업
@@ -278,6 +344,7 @@ fn help_items(watching: bool, has_errors: bool) -> Vec<(u8, String)> {
         (1, "j/k 이동".to_string()),
         (1, "l 들어가기".to_string()),
         (1, "h 상위".to_string()),
+        (2, "? 도움말".to_string()),
         (3, "r 갱신".to_string()),
         (6, "p 위쪽".to_string()),
         (5, "w 감시".to_string()),
@@ -286,7 +353,7 @@ fn help_items(watching: bool, has_errors: bool) -> Vec<(u8, String)> {
         items.push((7, "+/- 간격".to_string()));
     }
     items.push((4, "y/Y 복사".to_string()));
-    items.push((4, "o/O Finder".to_string()));
+    items.push((3, "o/O Finder".to_string()));
     items.push((5, "u 단위".to_string()));
     items.push((5, "s 기준".to_string()));
     items.push((5, "i 크기".to_string()));
@@ -518,7 +585,7 @@ mod tests {
             let width = Span::raw(line.clone()).width();
             assert!(width <= 80, "{width} columns for watching={watching} errors={has_errors}: {line:?}");
             // 이동, 종료, 그리고 새로 넣은 Finder 키는 80칸에서도 남아 있어야 한다
-            for must in ["j/k 이동", "l 들어가기", "h 상위", "q 종료", "o/O Finder"] {
+            for must in ["j/k 이동", "l 들어가기", "h 상위", "? 도움말", "q 종료", "o/O Finder"] {
                 assert!(line.contains(must), "{must:?} missing: {line:?}");
             }
             // 오류가 있으면 e 키 안내가 가장 먼저 남는 부가 항목이다

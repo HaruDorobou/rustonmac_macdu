@@ -161,6 +161,8 @@ pub struct App {
     /// 오류 목록 팝업이 열려 있는지
     pub show_errors: bool,
     pub error_state: ListState,
+    /// 키 도움말 팝업이 열려 있는지
+    pub show_help: bool,
     /// 지금 가장 위에 보이는 목록이 한 화면에 보여 주는 줄 수. 그릴 때마다 갱신된다.
     /// PageUp/PageDown과 Ctrl-d/Ctrl-u가 얼마나 움직일지 정하는 데 쓴다.
     pub page_rows: usize,
@@ -223,6 +225,7 @@ impl App {
             error_view: Vec::new(),
             show_errors: false,
             error_state: ListState::default(),
+            show_help: false,
             page_rows: 10,
             watch: None,
             last_watch_secs: DEFAULT_WATCH_SECS,
