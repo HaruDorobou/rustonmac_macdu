@@ -219,6 +219,9 @@ pub struct App {
     search_origin: Option<usize>,
     /// 마지막으로 확정한 검색어. `n`/`N`이 이것을 다시 찾는다.
     last_query: String,
+    /// 마지막으로 누른 글자 키가 한글(`Some(true)`)인지 영문(`Some(false)`)인지.
+    /// 글자 키를 아직 누르지 않아 알 수 없으면 `None`. 화면에 입력 상태를 알려 주는 용도다.
+    pub hangul: Option<bool>,
     /// 경고 팝업의 내용. 있으면 팝업이 열려 있고, 확인할 때까지 다른 키를 받지 않는다.
     pub warning: Option<String>,
     /// 키 도움말 팝업이 열려 있는지
@@ -286,6 +289,7 @@ impl App {
             show_errors: false,
             error_state: ListState::default(),
             show_help: false,
+            hangul: None,
             warning: None,
             find: None,
             sort: SortMode::default(),

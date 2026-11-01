@@ -125,7 +125,7 @@ fn draw_find(f: &mut Frame, app: &mut App) {
         })
         .collect();
 
-    let block = Block::default()
+    let mut block = Block::default()
         .borders(Borders::ALL)
         .title(format!(" 찾기 — {scope} "))
         .title_bottom(if typing {
@@ -133,6 +133,9 @@ fn draw_find(f: &mut Frame, app: &mut App) {
         } else {
             " j/k 이동 · Enter 그 위치로 · / 이름 입력 · Tab 종류 · Esc 닫기 "
         });
+    if let Some(label) = input_mode_label(app.hangul) {
+        block = block.title(Line::from(label).right_aligned());
+    }
     let inner = block.inner(area);
     f.render_widget(block, area);
     let rows = Layout::vertical([Constraint::Length(2), Constraint::Min(0)]).split(inner);
@@ -281,6 +284,32 @@ fn draw_expand(f: &mut Frame, app: &mut App) {
     f.render_stateful_widget(list, area, &mut app.expand_state);
 }
 
+/// 글자를 입력하는 칸에 붙이는 입력 상태 표시. 아직 알 수 없으면 `None`.
+fn input_mode_label(hangul: Option<bool>) -> Option<Span<'static>> {
+    hangul.map(|h| {
+        if h {
+            Span::styled(" [한글] ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+        } else {
+            Span::styled(" [영문] ", Style::default().fg(Color::DarkGray))
+        }
+    })
+}
+
+/// 헤더 제목. 한글 자판으로 키를 눌렀다면 그 사실과 한계를 알려 준다.
+fn header_title(hangul: bool) -> Line<'static> {
+    if hangul {
+        Line::from(vec![
+            Span::raw(" mac-du "),
+            Span::styled(
+                "[한글 자판 → 영문 키로 처리 · G S Y 같은 대문자 키는 영문으로 바꿔야 함] ",
+                Style::default().fg(Color::Yellow),
+            ),
+        ])
+    } else {
+        Line::from(" mac-du ")
+    }
+}
+
 fn draw_header(f: &mut Frame, app: &App, area: Rect) {
     let spinner = SPINNER[app.tick / 2 % SPINNER.len()];
     let now = Instant::now();
@@ -385,7 +414,7 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
         Block::default()
             .borders(Borders::ALL)
             .border_style(border)
-            .title(" mac-du "),
+            .title(header_title(app.hangul == Some(true))),
     );
     f.render_widget(header, area);
 }
@@ -473,7 +502,9 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         // 검색어 입력 중: 일치가 없으면 빨갛게
         let color = if app.search_has_match() { Color::Yellow } else { Color::Red };
         let note = if app.search_has_match() { "" } else { "  (일치 없음)" };
-        Paragraph::new(format!(" /{q}█{note}  Enter 확정 · Esc 취소")).style(Style::default().fg(color))
+        let mut spans = vec![Span::raw(format!(" /{q}█{note}  Enter 확정 · Esc 취소"))];
+        spans.extend(input_mode_label(app.hangul));
+        Paragraph::new(Line::from(spans)).style(Style::default().fg(color))
     } else if let Some(msg) = &app.status {
         Paragraph::new(format!(" ⚠ {}", msg)).style(Style::default().fg(Color::Red))
     } else if let Some(msg) = app.notice() {
@@ -796,6 +827,41 @@ mod tests {
         app.find_edit(|q| q.push_str("zzz"));
         let mut t = Terminal::new(TestBackend::new(100, 30)).unwrap();
         t.draw(|f| draw(f, &mut app)).unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_input_mode_label_appears_only_once_it_is_known() {
+        assert!(input_mode_label(None).is_none(), "nothing is claimed before a letter key is pressed");
+        assert!(input_mode_label(Some(true)).unwrap().content.contains("한글"));
+        assert!(input_mode_label(Some(false)).unwrap().content.contains("영문"));
+
+        // 찾기 화면에서 글자를 입력하는 중에도 그려진다
+        use ratatui::{backend::TestBackend, Terminal};
+        let root = std::env::temp_dir().join(format!("mac-du-ui-mode-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("a")).unwrap();
+        std::fs::write(root.join("a/f.txt"), vec![1u8; 10_000]).unwrap();
+        let mut app = App::new(root.clone());
+        for _ in 0..500 {
+            app.poll_scan();
+            if app.scanning.is_none() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        app.open_find();
+        app.find_set_typing(true);
+        app.hangul = Some(false);
+        let mut t = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        t.draw(|f| draw(f, &mut app)).unwrap();
+        let drawn: String = t.backend().buffer().content().iter().map(|c| c.symbol()).collect();
+        // 한글은 칸이 나뉘어 이어지지 않으므로, 라벨의 대괄호 개수 차이로 확인한다
+        let with = drawn.matches('[').count();
+        app.hangul = None;
+        t.draw(|f| draw(f, &mut app)).unwrap();
+        let without: String = t.backend().buffer().content().iter().map(|c| c.symbol()).collect();
+        assert_eq!(with, without.matches('[').count() + 1, "the label adds one bracket pair");
         let _ = std::fs::remove_dir_all(&root);
     }
 

@@ -3,6 +3,7 @@ mod cli;
 mod clipboard;
 mod find;
 mod finder;
+mod hangul;
 mod units;
 mod scanner;
 mod ui;
@@ -114,6 +115,149 @@ fn jump_for(key: &KeyEvent, pending_g: &mut bool, page_rows: usize) -> Option<Ju
     }
 }
 
+/// 키 하나를 처리한다. 열려 있는 팝업이나 입력 중인 칸이 있으면 그쪽이 먼저 받는다.
+fn handle_key(app: &mut App, key: KeyEvent, pending_g: &mut bool) {
+        let jump = jump_for(&key, pending_g, app.page_rows);
+        // 경고 팝업은 확인할 때까지 다른 키를 받지 않는다
+        if app.warning.is_some() {
+            if matches!(
+                key.code,
+                KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char(' ')
+            ) {
+                app.warning = None;
+            }
+            return;
+        }
+        // 검색어를 입력하는 중에는 글자 키를 모두 검색어로 받는다
+        if app.search_input.is_some() {
+            match key.code {
+                KeyCode::Enter => app.search_confirm(),
+                KeyCode::Esc => app.search_cancel(),
+                KeyCode::Backspace => {
+                    if app.search_input.as_deref() == Some("") {
+                        app.search_cancel();
+                    } else {
+                        app.search_edit(|q| {
+                            q.pop();
+                        });
+                    }
+                }
+                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    app.search_edit(|q| q.push(c));
+                }
+                _ => {}
+            }
+            return;
+        }
+        // 찾기 화면: 검색어를 치는 중이면 글자를 받고, 아니면 목록을 탐색한다
+        if app.find.is_some() {
+            if app.find.as_ref().is_some_and(|v| v.typing) {
+                match key.code {
+                    KeyCode::Enter | KeyCode::Esc => app.find_set_typing(false),
+                    KeyCode::Tab => app.find_cycle_kind(),
+                    KeyCode::Backspace => app.find_edit(|q| {
+                        q.pop();
+                    }),
+                    KeyCode::Up => app.find_jump(Jump::Up(1)),
+                    KeyCode::Down => app.find_jump(Jump::Down(1)),
+                    KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        app.find_edit(|q| q.push(c))
+                    }
+                    _ => {}
+                }
+                return;
+            }
+            if let Some(j) = jump {
+                app.find_jump(j);
+                return;
+            }
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('f') => app.close_find(),
+                KeyCode::Char('/') => app.find_set_typing(true),
+                KeyCode::Tab => app.find_cycle_kind(),
+                KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => app.find_go(),
+                KeyCode::Up | KeyCode::Char('k') => app.find_jump(Jump::Up(1)),
+                KeyCode::Down | KeyCode::Char('j') => app.find_jump(Jump::Down(1)),
+                _ => {}
+            }
+            return;
+        }
+        // 도움말 팝업이 열려 있으면 닫는 키만 받는다
+        if app.show_help {
+            if matches!(
+                key.code,
+                KeyCode::Char('?') | KeyCode::Char('q') | KeyCode::Esc | KeyCode::Enter
+            ) {
+                app.show_help = false;
+            }
+            return;
+        }
+        // 오류 팝업이 열려 있으면 팝업이 키를 모두 가져간다
+        if app.show_errors {
+            if let Some(j) = jump {
+                app.error_jump(j);
+                return;
+            }
+            match key.code {
+                KeyCode::Char('e') | KeyCode::Char('q') | KeyCode::Esc => {
+                    app.show_errors = false
+                }
+                KeyCode::Up | KeyCode::Char('k') => app.error_previous(),
+                KeyCode::Down | KeyCode::Char('j') => app.error_next(),
+                _ => {}
+            }
+            return;
+        }
+        if app.show_expand {
+            if let Some(j) = jump {
+                app.expand_jump(j);
+                return;
+            }
+            match key.code {
+                KeyCode::Char('p') | KeyCode::Char('q') | KeyCode::Esc => {
+                    app.close_expand()
+                }
+                KeyCode::Up | KeyCode::Char('k') => app.expand_previous(),
+                KeyCode::Down | KeyCode::Char('j') => app.expand_next(),
+                KeyCode::Enter | KeyCode::Char('l') => app.confirm_expand(),
+                _ => {}
+            }
+            return;
+        }
+        if let Some(j) = jump {
+            app.jump(j);
+            return;
+        }
+        match key.code {
+            KeyCode::Char('?') => app.show_help = true,
+            KeyCode::Char('f') => app.open_find(),
+            KeyCode::Char('S') => app.cycle_sort(),
+            KeyCode::Char('/') => app.start_search(),
+            KeyCode::Char('n') => app.search_next(true),
+            KeyCode::Char('N') => app.search_next(false),
+            KeyCode::Char('p') => app.open_expand(),
+            KeyCode::Char('y') => app.copy_selected(),
+            KeyCode::Char('Y') => app.copy_current(),
+            KeyCode::Char('u') => app.cycle_unit(),
+            KeyCode::Char('s') => app.toggle_base(),
+            KeyCode::Char('i') => app.show_exact(),
+            KeyCode::Char('o') => app.reveal_selected(),
+            KeyCode::Char('O') => app.open_current(),
+            KeyCode::Char('e') => app.toggle_errors(),
+            KeyCode::Char('r') => app.rescan(),
+            KeyCode::Char('w') => app.toggle_watch(),
+            // + 는 Shift가 필요하므로 같은 키의 = 도 받는다
+            KeyCode::Char('+') | KeyCode::Char('=') => app.adjust_watch(true),
+            KeyCode::Char('-') => app.adjust_watch(false),
+            KeyCode::Char('q') | KeyCode::Esc => app.should_quit = true,
+            KeyCode::Up | KeyCode::Char('k') => app.previous(),
+            KeyCode::Down | KeyCode::Char('j') => app.next(),
+            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => app.enter(),
+            KeyCode::Backspace | KeyCode::Left | KeyCode::Char('h') => app.back(),
+            _ => {}
+        }
+}
+
 fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> io::Result<()> {
     let mut pending_g = false;
     while !app.should_quit {
@@ -126,144 +270,38 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> io::
                 if key.kind != KeyEventKind::Press {
                     continue;
                 }
-                let jump = jump_for(&key, &mut pending_g, app.page_rows);
-                // 경고 팝업은 확인할 때까지 다른 키를 받지 않는다
-                if app.warning.is_some() {
-                    if matches!(
-                        key.code,
-                        KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char(' ')
-                    ) {
-                        app.warning = None;
+                // 한글/영문 어느 쪽으로 치고 있는지는 어떤 칸에서든 화면에 알려 준다
+                let plain_char = match key.code {
+                    KeyCode::Char(c) if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => Some(c),
+                    _ => None,
+                };
+                if let Some(c) = plain_char {
+                    if hangul::is_hangul(c) {
+                        app.hangul = Some(true);
+                    } else if c.is_ascii_alphabetic() {
+                        app.hangul = Some(false);
                     }
-                    continue;
                 }
-                // 검색어를 입력하는 중에는 글자 키를 모두 검색어로 받는다
-                if app.search_input.is_some() {
-                    match key.code {
-                        KeyCode::Enter => app.search_confirm(),
-                        KeyCode::Esc => app.search_cancel(),
-                        KeyCode::Backspace => {
-                            if app.search_input.as_deref() == Some("") {
-                                app.search_cancel();
-                            } else {
-                                app.search_edit(|q| {
-                                    q.pop();
-                                });
-                            }
-                        }
-                        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            app.search_edit(|q| q.push(c));
-                        }
-                        _ => {}
+                // 글자를 입력하는 칸이 아닐 때만, 한글 자판으로 눌린 키를 영문 키로 되돌린다
+                let typing = app.search_input.is_some() || app.find.as_ref().is_some_and(|v| v.typing);
+                let mut keys = vec![key];
+                if let (false, Some(c)) = (typing, plain_char) {
+                    if let Some(mapped) = hangul::to_keys(c) {
+                        keys = mapped
+                            .into_iter()
+                            .map(|a| {
+                                let mods = if a.is_ascii_uppercase() {
+                                    KeyModifiers::SHIFT
+                                } else {
+                                    KeyModifiers::NONE
+                                };
+                                KeyEvent::new(KeyCode::Char(a), mods)
+                            })
+                            .collect();
                     }
-                    continue;
                 }
-                // 찾기 화면: 검색어를 치는 중이면 글자를 받고, 아니면 목록을 탐색한다
-                if app.find.is_some() {
-                    if app.find.as_ref().is_some_and(|v| v.typing) {
-                        match key.code {
-                            KeyCode::Enter | KeyCode::Esc => app.find_set_typing(false),
-                            KeyCode::Tab => app.find_cycle_kind(),
-                            KeyCode::Backspace => app.find_edit(|q| {
-                                q.pop();
-                            }),
-                            KeyCode::Up => app.find_jump(Jump::Up(1)),
-                            KeyCode::Down => app.find_jump(Jump::Down(1)),
-                            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                                app.find_edit(|q| q.push(c))
-                            }
-                            _ => {}
-                        }
-                        continue;
-                    }
-                    if let Some(j) = jump {
-                        app.find_jump(j);
-                        continue;
-                    }
-                    match key.code {
-                        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('f') => app.close_find(),
-                        KeyCode::Char('/') => app.find_set_typing(true),
-                        KeyCode::Tab => app.find_cycle_kind(),
-                        KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => app.find_go(),
-                        KeyCode::Up | KeyCode::Char('k') => app.find_jump(Jump::Up(1)),
-                        KeyCode::Down | KeyCode::Char('j') => app.find_jump(Jump::Down(1)),
-                        _ => {}
-                    }
-                    continue;
-                }
-                // 도움말 팝업이 열려 있으면 닫는 키만 받는다
-                if app.show_help {
-                    if matches!(
-                        key.code,
-                        KeyCode::Char('?') | KeyCode::Char('q') | KeyCode::Esc | KeyCode::Enter
-                    ) {
-                        app.show_help = false;
-                    }
-                    continue;
-                }
-                // 오류 팝업이 열려 있으면 팝업이 키를 모두 가져간다
-                if app.show_errors {
-                    if let Some(j) = jump {
-                        app.error_jump(j);
-                        continue;
-                    }
-                    match key.code {
-                        KeyCode::Char('e') | KeyCode::Char('q') | KeyCode::Esc => {
-                            app.show_errors = false
-                        }
-                        KeyCode::Up | KeyCode::Char('k') => app.error_previous(),
-                        KeyCode::Down | KeyCode::Char('j') => app.error_next(),
-                        _ => {}
-                    }
-                    continue;
-                }
-                if app.show_expand {
-                    if let Some(j) = jump {
-                        app.expand_jump(j);
-                        continue;
-                    }
-                    match key.code {
-                        KeyCode::Char('p') | KeyCode::Char('q') | KeyCode::Esc => {
-                            app.close_expand()
-                        }
-                        KeyCode::Up | KeyCode::Char('k') => app.expand_previous(),
-                        KeyCode::Down | KeyCode::Char('j') => app.expand_next(),
-                        KeyCode::Enter | KeyCode::Char('l') => app.confirm_expand(),
-                        _ => {}
-                    }
-                    continue;
-                }
-                if let Some(j) = jump {
-                    app.jump(j);
-                    continue;
-                }
-                match key.code {
-                    KeyCode::Char('?') => app.show_help = true,
-                    KeyCode::Char('f') => app.open_find(),
-                    KeyCode::Char('S') => app.cycle_sort(),
-                    KeyCode::Char('/') => app.start_search(),
-                    KeyCode::Char('n') => app.search_next(true),
-                    KeyCode::Char('N') => app.search_next(false),
-                    KeyCode::Char('p') => app.open_expand(),
-                    KeyCode::Char('y') => app.copy_selected(),
-                    KeyCode::Char('Y') => app.copy_current(),
-                    KeyCode::Char('u') => app.cycle_unit(),
-                    KeyCode::Char('s') => app.toggle_base(),
-                    KeyCode::Char('i') => app.show_exact(),
-                    KeyCode::Char('o') => app.reveal_selected(),
-                    KeyCode::Char('O') => app.open_current(),
-                    KeyCode::Char('e') => app.toggle_errors(),
-                    KeyCode::Char('r') => app.rescan(),
-                    KeyCode::Char('w') => app.toggle_watch(),
-                    // + 는 Shift가 필요하므로 같은 키의 = 도 받는다
-                    KeyCode::Char('+') | KeyCode::Char('=') => app.adjust_watch(true),
-                    KeyCode::Char('-') => app.adjust_watch(false),
-                    KeyCode::Char('q') | KeyCode::Esc => app.should_quit = true,
-                    KeyCode::Up | KeyCode::Char('k') => app.previous(),
-                    KeyCode::Down | KeyCode::Char('j') => app.next(),
-                    KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => app.enter(),
-                    KeyCode::Backspace | KeyCode::Left | KeyCode::Char('h') => app.back(),
-                    _ => {}
+                for k in keys {
+                    handle_key(app, k, &mut pending_g);
                 }
             }
         }
@@ -314,6 +352,73 @@ mod tests {
         // 아주 작은 화면에서도 최소 한 줄은 움직인다
         assert_eq!(jump_for(&pgdn, &mut g, 1), Some(Jump::Down(1)));
         assert_eq!(jump_for(&ctrl_d, &mut g, 1), Some(Jump::Down(1)));
+    }
+
+    /// 키를 한 번 넣어 보는 시험용: 한글로 눌린 키가 단축키로 동작하는지
+    fn press(app: &mut App, pending_g: &mut bool, c: char) {
+        let typing = app.search_input.is_some() || app.find.as_ref().is_some_and(|v| v.typing);
+        let mut keys = vec![plain(c)];
+        if !typing {
+            if let Some(mapped) = hangul::to_keys(c) {
+                app.hangul = Some(true);
+                keys = mapped.into_iter().map(plain).collect();
+            }
+        }
+        for k in keys {
+            handle_key(app, k, pending_g);
+        }
+    }
+
+    #[test]
+    fn shortcuts_work_with_a_korean_keyboard_but_typed_text_stays_korean() {
+        let root = std::env::temp_dir().join(format!("mac-du-hangul-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for n in ["가나", "bb", "cc"] {
+            std::fs::create_dir_all(root.join(n)).unwrap();
+            std::fs::write(root.join(n).join("f"), vec![1u8; 5_000]).unwrap();
+        }
+        let mut app = App::new(root.clone());
+        for _ in 0..500 {
+            app.poll_scan();
+            if app.scanning.is_none() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let mut g = false;
+
+        // ㅓ ㅏ = j k: 아래로, 위로
+        let before = app.state.selected();
+        press(&mut app, &mut g, 'ㅓ');
+        assert_eq!(app.state.selected(), before.map(|i| i + 1));
+        press(&mut app, &mut g, 'ㅏ');
+        assert_eq!(app.state.selected(), before);
+        assert_eq!(app.hangul, Some(true), "the header is told a Korean keyboard is in use");
+
+        // ㅎㅎ = gg
+        press(&mut app, &mut g, 'ㅓ');
+        press(&mut app, &mut g, 'ㅎ');
+        press(&mut app, &mut g, 'ㅎ');
+        assert_eq!(app.state.selected(), Some(0), "ㅎㅎ is gg");
+
+        // ㅣ = l 로 들어가고, h l 이 홀모음 'ㅚ'로 합쳐져 와도 두 키로 풀려서 제자리로 돌아온다
+        press(&mut app, &mut g, 'ㅣ');
+        let inside = app.current.clone();
+        assert_ne!(inside, root);
+        press(&mut app, &mut g, 'ㅚ');
+        assert_eq!(app.current, inside, "went up and came back into the same folder");
+        press(&mut app, &mut g, 'ㅗ'); // h: 상위로
+        assert_eq!(app.current, root);
+
+        // 검색어를 칠 때는 한글이 그대로 들어간다
+        press(&mut app, &mut g, '/');
+        press(&mut app, &mut g, '가');
+        press(&mut app, &mut g, '나');
+        assert_eq!(app.search_input.as_deref(), Some("가나"));
+        handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut g);
+        let i = app.state.selected().unwrap();
+        assert_eq!(&*app.children()[i].name, "가나", "the highlight followed the Korean query");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
