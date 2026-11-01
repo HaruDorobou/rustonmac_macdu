@@ -118,6 +118,11 @@ fn jump_for(key: &KeyEvent, pending_g: &mut bool, page_rows: usize) -> Option<Ju
 
 /// 키 하나를 처리한다. 열려 있는 팝업이나 입력 중인 칸이 있으면 그쪽이 먼저 받는다.
 fn handle_key(app: &mut App, key: KeyEvent, pending_g: &mut bool) {
+    // 터미널은 raw 모드라 Ctrl-c가 신호로 오지 않고 키로 온다. 어떤 팝업이나 입력 칸에서도 종료한다.
+    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        app.should_quit = true;
+        return;
+    }
         let jump = jump_for(&key, pending_g, app.page_rows);
         // 경고 팝업은 확인할 때까지 다른 키를 받지 않는다
         if app.warning.is_some() {
@@ -412,6 +417,44 @@ mod tests {
         handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut g);
         let i = app.state.selected().unwrap();
         assert_eq!(&*app.children()[i].name, "가나", "the highlight followed the Korean query");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn ctrl_c_quits_from_the_list_a_popup_and_a_text_field_but_plain_c_does_not() {
+        let root = std::env::temp_dir().join(format!("mac-du-ctrlc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("a")).unwrap();
+        std::fs::write(root.join("a/f"), vec![1u8; 5_000]).unwrap();
+        let mut app = App::new(root.clone());
+        for _ in 0..500 {
+            app.poll_scan();
+            if app.scanning.is_none() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let mut g = false;
+        let ctrl_c = key(KeyCode::Char('c'), KeyModifiers::CONTROL);
+
+        handle_key(&mut app, plain('c'), &mut g);
+        assert!(!app.should_quit, "a plain c does nothing");
+        handle_key(&mut app, ctrl_c, &mut g);
+        assert!(app.should_quit);
+
+        for open in [KeyCode::Char('?'), KeyCode::Char('/'), KeyCode::Char('f')] {
+            app.should_quit = false;
+            handle_key(&mut app, KeyEvent::new(open, KeyModifiers::NONE), &mut g);
+            if open == KeyCode::Char('f') {
+                handle_key(&mut app, plain('/'), &mut g); // 찾기 화면의 글자 입력 칸
+                assert!(app.find.as_ref().is_some_and(|v| v.typing));
+            }
+            handle_key(&mut app, ctrl_c, &mut g);
+            assert!(app.should_quit, "Ctrl-c must quit even after {open:?}");
+            app.show_help = false;
+            app.search_input = None;
+            app.find = None;
+        }
         let _ = std::fs::remove_dir_all(&root);
     }
 
