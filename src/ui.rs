@@ -86,8 +86,8 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
             line1.push(Span::raw(format!(" {} 스캔 중… {}", spinner, dir.display())));
         }
         _ => {
-            // 이 폴더 데이터를 읽은 시점(일부만 갱신했다면 가장 오래된 부분 기준)과,
-            // 같은 스캔이 걸린 시간. 폴더를 오가도 다시 스캔하지 않으므로 이 숫자가
+            // 이 폴더 데이터를 읽은 시점을 읽은 스캔 하나의 시각과,
+            // 그 스캔이 걸린 시간. 폴더를 오가도 다시 스캔하지 않으므로 이 숫자가
             // 곧 "지금 보는 데이터가 얼마나 오래됐는지"다.
             let took = match app.scanned_at() {
                 Some(at) => {

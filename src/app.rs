@@ -797,10 +797,11 @@ impl App {
         (self.clock)()
     }
 
-    /// 지금 보고 있는 폴더의 데이터를 읽은 시각. 일부만 다시 스캔해 시각이 섞여 있으면
-    /// 가장 오래된 쪽이다. 아직 스캔하기 전이면 `None`.
+    /// 지금 보고 있는 폴더의 목록을 읽은 스캔의 시작 시각. 아래 폴더 일부를 따로 다시 스캔했거나
+    /// 범위를 넓히며 이전 결과를 재사용했더라도, 이 폴더를 읽은 스캔 하나만 가리킨다.
+    /// (소요 시간과 같은 스캔에서 가져와야 서로 맞는 숫자가 된다.) 아직 스캔하기 전이면 `None`.
     pub fn scanned_at(&self) -> Option<u32> {
-        let t = self.current_node().oldest;
+        let t = self.current_node().scanned;
         (t != 0 && t != u32::MAX).then_some(t)
     }
 
@@ -1182,8 +1183,9 @@ mod tests {
         let age = |name: &str| app.children().iter().find(|c| &*c.name == name).unwrap().oldest;
         assert_eq!(age("x"), 1000, "x was reused, so it keeps the time it was read");
         assert_eq!(age("y"), 5000, "y was read just now");
-        assert_eq!(app.scanned_at(), Some(1000), "the folder is as old as its oldest part");
+        assert_eq!(app.scanned_at(), Some(5000), "the folder itself was listed by the newer scan");
         assert!(app.scan_duration_at(1000).is_some() && app.scan_duration_at(5000).is_some());
+        assert!(app.scan_duration_at(app.scanned_at().unwrap()).is_some());
 
         fs::remove_dir_all(&root).unwrap();
     }
