@@ -10,14 +10,14 @@ use std::io::{self, Stdout};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
 
-use app::App;
+use app::{App, Jump};
 
 fn main() -> io::Result<()> {
     // 옵션 오류는 터미널을 raw 모드로 바꾸기 전에 처리해야 메시지가 제대로 보인다
@@ -85,7 +85,35 @@ fn resolve_dir(path: &Path, label: &str) -> PathBuf {
     }
 }
 
+/// 크게 움직이는 키를 `Jump`로 바꾼다: `gg`/Home, `G`/End, Ctrl-d/Ctrl-u, PageDown/PageUp.
+/// `gg`는 두 번 눌러야 하므로 앞서 `g`를 눌렀는지를 `pending_g`에 기억한다.
+/// 어떤 키든 한 번 지나가면 대기 상태는 풀린다.
+fn jump_for(key: &KeyEvent, pending_g: &mut bool, page_rows: usize) -> Option<Jump> {
+    let after_g = std::mem::take(pending_g);
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let page = page_rows.saturating_sub(1).max(1);
+    let half = (page_rows / 2).max(1);
+    match key.code {
+        KeyCode::Char('g') if !ctrl => {
+            if after_g {
+                Some(Jump::Top)
+            } else {
+                *pending_g = true;
+                None
+            }
+        }
+        KeyCode::Home => Some(Jump::Top),
+        KeyCode::Char('G') | KeyCode::End => Some(Jump::Bottom),
+        KeyCode::Char('d') if ctrl => Some(Jump::Down(half)),
+        KeyCode::Char('u') if ctrl => Some(Jump::Up(half)),
+        KeyCode::PageDown => Some(Jump::Down(page)),
+        KeyCode::PageUp => Some(Jump::Up(page)),
+        _ => None,
+    }
+}
+
 fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> io::Result<()> {
+    let mut pending_g = false;
     while !app.should_quit {
         app.poll_scan();
         terminal.draw(|f| ui::draw(f, app))?;
@@ -96,8 +124,13 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> io::
                 if key.kind != KeyEventKind::Press {
                     continue;
                 }
+                let jump = jump_for(&key, &mut pending_g, app.page_rows);
                 // 오류 팝업이 열려 있으면 팝업이 키를 모두 가져간다
                 if app.show_errors {
+                    if let Some(j) = jump {
+                        app.error_jump(j);
+                        continue;
+                    }
                     match key.code {
                         KeyCode::Char('e') | KeyCode::Char('q') | KeyCode::Esc => {
                             app.show_errors = false
@@ -109,6 +142,10 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> io::
                     continue;
                 }
                 if app.show_expand {
+                    if let Some(j) = jump {
+                        app.expand_jump(j);
+                        continue;
+                    }
                     match key.code {
                         KeyCode::Char('p') | KeyCode::Char('q') | KeyCode::Esc => {
                             app.close_expand()
@@ -118,6 +155,10 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> io::
                         KeyCode::Enter | KeyCode::Char('l') => app.confirm_expand(),
                         _ => {}
                     }
+                    continue;
+                }
+                if let Some(j) = jump {
+                    app.jump(j);
                     continue;
                 }
                 match key.code {
@@ -146,4 +187,57 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> io::
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(code, mods)
+    }
+    fn plain(c: char) -> KeyEvent {
+        key(KeyCode::Char(c), KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn gg_needs_two_presses_and_any_other_key_cancels_it() {
+        let mut g = false;
+        assert_eq!(jump_for(&plain('g'), &mut g, 20), None, "one g only waits");
+        assert!(g);
+        assert_eq!(jump_for(&plain('g'), &mut g, 20), Some(Jump::Top));
+        assert!(!g, "the second g is consumed");
+
+        assert_eq!(jump_for(&plain('g'), &mut g, 20), None);
+        assert_eq!(jump_for(&plain('j'), &mut g, 20), None);
+        assert!(!g, "another key cancels the pending g");
+        assert_eq!(jump_for(&plain('g'), &mut g, 20), None, "so the next g starts over");
+    }
+
+    #[test]
+    fn the_other_jump_keys() {
+        let mut g = false;
+        let shift_g = key(KeyCode::Char('G'), KeyModifiers::SHIFT);
+        assert_eq!(jump_for(&shift_g, &mut g, 20), Some(Jump::Bottom));
+        assert_eq!(jump_for(&key(KeyCode::End, KeyModifiers::NONE), &mut g, 20), Some(Jump::Bottom));
+        assert_eq!(jump_for(&key(KeyCode::Home, KeyModifiers::NONE), &mut g, 20), Some(Jump::Top));
+        let ctrl_d = key(KeyCode::Char('d'), KeyModifiers::CONTROL);
+        let ctrl_u = key(KeyCode::Char('u'), KeyModifiers::CONTROL);
+        assert_eq!(jump_for(&ctrl_d, &mut g, 20), Some(Jump::Down(10)), "half a screen");
+        assert_eq!(jump_for(&ctrl_u, &mut g, 20), Some(Jump::Up(10)));
+        let pgdn = key(KeyCode::PageDown, KeyModifiers::NONE);
+        let pgup = key(KeyCode::PageUp, KeyModifiers::NONE);
+        assert_eq!(jump_for(&pgdn, &mut g, 20), Some(Jump::Down(19)), "a page keeps one line of context");
+        assert_eq!(jump_for(&pgup, &mut g, 20), Some(Jump::Up(19)));
+        // 아주 작은 화면에서도 최소 한 줄은 움직인다
+        assert_eq!(jump_for(&pgdn, &mut g, 1), Some(Jump::Down(1)));
+        assert_eq!(jump_for(&ctrl_d, &mut g, 1), Some(Jump::Down(1)));
+    }
+
+    #[test]
+    fn plain_d_and_u_are_not_jumps_so_u_still_cycles_the_unit() {
+        let mut g = false;
+        assert_eq!(jump_for(&plain('d'), &mut g, 20), None);
+        assert_eq!(jump_for(&plain('u'), &mut g, 20), None);
+    }
 }

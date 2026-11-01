@@ -72,6 +72,7 @@ fn draw_expand(f: &mut Frame, app: &mut App) {
         )
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
         .highlight_symbol("> ");
+    app.page_rows = area.height.saturating_sub(2) as usize;
     f.render_stateful_widget(list, area, &mut app.expand_state);
 }
 
@@ -252,6 +253,7 @@ fn draw_list(f: &mut Frame, app: &mut App, area: Rect) {
         .block(Block::default().borders(Borders::ALL))
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
         .highlight_symbol("> ");
+    app.page_rows = area.height.saturating_sub(2) as usize;
     f.render_stateful_widget(list, area, &mut app.state);
 }
 
@@ -364,6 +366,7 @@ fn draw_errors(f: &mut Frame, app: &mut App) {
         )
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
         .highlight_symbol("> ");
+    app.page_rows = area.height.saturating_sub(2) as usize;
     f.render_stateful_widget(list, area, &mut app.error_state);
 }
 

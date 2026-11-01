@@ -102,6 +102,30 @@ struct Changes {
     map: HashMap<String, Change>,
 }
 
+/// 목록 안에서 한 번에 크게 움직이는 방법 (vim의 gg, G, Ctrl-d, Ctrl-u 등)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Jump {
+    Top,
+    Bottom,
+    Down(usize),
+    Up(usize),
+}
+
+/// 항목이 `len`개인 목록에서 `selected`를 `jump`만큼 옮긴 위치. 목록이 비어 있으면 `None`.
+/// 끝을 넘어가면 처음이나 끝에서 멈춘다 (돌아 나오지 않는다).
+fn jumped(selected: Option<usize>, len: usize, jump: Jump) -> Option<usize> {
+    if len == 0 {
+        return None;
+    }
+    let cur = selected.unwrap_or(0).min(len - 1);
+    Some(match jump {
+        Jump::Top => 0,
+        Jump::Bottom => len - 1,
+        Jump::Down(n) => cur.saturating_add(n).min(len - 1),
+        Jump::Up(n) => cur.saturating_sub(n),
+    })
+}
+
 pub struct App {
     /// 스캔해 둔 트리의 루트 폴더 (시작한 폴더, 또는 거기서 위로 올라간 폴더)
     tree_root: PathBuf,
@@ -137,6 +161,9 @@ pub struct App {
     /// 오류 목록 팝업이 열려 있는지
     pub show_errors: bool,
     pub error_state: ListState,
+    /// 지금 가장 위에 보이는 목록이 한 화면에 보여 주는 줄 수. 그릴 때마다 갱신된다.
+    /// PageUp/PageDown과 Ctrl-d/Ctrl-u가 얼마나 움직일지 정하는 데 쓴다.
+    pub page_rows: usize,
 
     pub watch: Option<Watch>,
     /// 감시를 껐다 켜도 마지막에 쓴 간격을 기억한다
@@ -196,6 +223,7 @@ impl App {
             error_view: Vec::new(),
             show_errors: false,
             error_state: ListState::default(),
+            page_rows: 10,
             watch: None,
             last_watch_secs: DEFAULT_WATCH_SECS,
             last_checked: None,
@@ -250,6 +278,12 @@ impl App {
         }
         let i = self.state.selected().map_or(0, |i| i.saturating_sub(1));
         self.state.select(Some(i));
+    }
+
+    /// 목록에서 선택을 크게 옮긴다.
+    pub fn jump(&mut self, jump: Jump) {
+        let i = jumped(self.state.selected(), self.children().len(), jump);
+        self.state.select(i);
     }
 
     /// 선택한 항목이 폴더면 그 안으로 들어간다. 이미 스캔해 둔 트리에서 바로 보여 주므로
@@ -428,6 +462,11 @@ impl App {
         self.expand_state.select(Some(i));
     }
 
+    pub fn expand_jump(&mut self, jump: Jump) {
+        let i = jumped(self.expand_state.selected(), self.expand_candidates.len(), jump);
+        self.expand_state.select(i);
+    }
+
     pub fn expand_previous(&mut self) {
         if self.expand_candidates.is_empty() {
             return;
@@ -591,6 +630,11 @@ impl App {
         let last = self.error_view.len() - 1;
         let i = self.error_state.selected().map_or(0, |i| (i + 1).min(last));
         self.error_state.select(Some(i));
+    }
+
+    pub fn error_jump(&mut self, jump: Jump) {
+        let i = jumped(self.error_state.selected(), self.error_view.len(), jump);
+        self.error_state.select(i);
     }
 
     pub fn error_previous(&mut self) {
@@ -1186,6 +1230,41 @@ mod tests {
         assert_eq!(app.scanned_at(), Some(5000), "the folder itself was listed by the newer scan");
         assert!(app.scan_duration_at(1000).is_some() && app.scan_duration_at(5000).is_some());
         assert!(app.scan_duration_at(app.scanned_at().unwrap()).is_some());
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn jumping_stops_at_both_ends_and_tolerates_empty_lists() {
+        assert_eq!(jumped(Some(3), 10, Jump::Top), Some(0));
+        assert_eq!(jumped(Some(3), 10, Jump::Bottom), Some(9));
+        assert_eq!(jumped(Some(3), 10, Jump::Down(4)), Some(7));
+        assert_eq!(jumped(Some(3), 10, Jump::Down(100)), Some(9), "does not run past the end");
+        assert_eq!(jumped(Some(3), 10, Jump::Up(100)), Some(0), "does not run past the top");
+        assert_eq!(jumped(None, 10, Jump::Down(2)), Some(2), "nothing selected counts as the top");
+        assert_eq!(jumped(Some(50), 10, Jump::Up(1)), Some(8), "a stale selection is clamped first");
+        assert_eq!(jumped(Some(0), 0, Jump::Bottom), None);
+        assert_eq!(jumped(None, 0, Jump::Top), None);
+    }
+
+    #[test]
+    fn jump_moves_the_highlight_in_the_main_list() {
+        let root = temp_root("jump");
+        for n in 0..6 {
+            fs::create_dir_all(root.join(format!("d{n}"))).unwrap();
+            fs::write(root.join(format!("d{n}/f")), vec![1u8; 1_000 * (n + 1)]).unwrap();
+        }
+        let mut app = App::new(root.clone());
+        wait(&mut app);
+
+        app.jump(Jump::Bottom);
+        assert_eq!(app.state.selected(), Some(5));
+        app.jump(Jump::Up(2));
+        assert_eq!(app.state.selected(), Some(3));
+        app.jump(Jump::Top);
+        assert_eq!(app.state.selected(), Some(0));
+        app.jump(Jump::Down(99));
+        assert_eq!(app.state.selected(), Some(5));
 
         fs::remove_dir_all(&root).unwrap();
     }
