@@ -205,6 +205,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> io::
                 }
                 match key.code {
                     KeyCode::Char('?') => app.show_help = true,
+                    KeyCode::Char('S') => app.cycle_sort(),
                     KeyCode::Char('/') => app.start_search(),
                     KeyCode::Char('n') => app.search_next(true),
                     KeyCode::Char('N') => app.search_next(false),

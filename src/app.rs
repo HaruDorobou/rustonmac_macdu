@@ -104,6 +104,33 @@ struct Changes {
     map: HashMap<String, Change>,
 }
 
+/// 목록 정렬 순서. 스캔 결과는 항상 크기 큰 순으로 저장되고, 보고 있는 폴더만 이 순서로 다시 늘어놓는다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SortMode {
+    #[default]
+    SizeDesc,
+    Name,
+    SizeAsc,
+}
+
+impl SortMode {
+    pub fn next(self) -> Self {
+        match self {
+            SortMode::SizeDesc => SortMode::Name,
+            SortMode::Name => SortMode::SizeAsc,
+            SortMode::SizeAsc => SortMode::SizeDesc,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            SortMode::SizeDesc => "크기 큰 순",
+            SortMode::Name => "이름순",
+            SortMode::SizeAsc => "크기 작은 순",
+        }
+    }
+}
+
 /// 목록 안에서 한 번에 크게 움직이는 방법 (vim의 gg, G, Ctrl-d, Ctrl-u 등)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Jump {
@@ -163,6 +190,8 @@ pub struct App {
     /// 오류 목록 팝업이 열려 있는지
     pub show_errors: bool,
     pub error_state: ListState,
+    /// 지금 보고 있는 폴더의 정렬 순서
+    pub sort: SortMode,
     /// 검색어를 입력하는 중이면 지금까지 친 글자
     pub search_input: Option<String>,
     /// 검색을 시작하기 전에 선택돼 있던 위치. `Esc`로 취소하면 여기로 돌아간다.
@@ -237,6 +266,7 @@ impl App {
             error_state: ListState::default(),
             show_help: false,
             warning: None,
+            sort: SortMode::default(),
             search_input: None,
             search_origin: None,
             last_query: String::new(),
@@ -265,6 +295,39 @@ impl App {
             node = &node.children[i];
         }
         node
+    }
+
+    fn current_node_mut(&mut self) -> &mut Node {
+        let mut node = &mut self.root;
+        for &i in &self.stack {
+            node = &mut node.children[i];
+        }
+        node
+    }
+
+    /// `S`: 정렬 순서를 크기 큰 순 → 이름순 → 크기 작은 순으로 바꾼다.
+    pub fn cycle_sort(&mut self) {
+        self.sort = self.sort.next();
+        self.apply_sort();
+        self.notice = Some((format!("정렬: {}", self.sort.label()), Instant::now()));
+    }
+
+    /// 지금 보고 있는 폴더를 `sort` 순서로 늘어놓고, 하이라이트는 같은 항목에 둔다.
+    /// 상위 폴더들은 건드리지 않는다. (스택이 부모 안의 위치를 기억하므로 현재 폴더 안의 순서만 바꾼다.)
+    /// 다른 폴더는 들어가거나 돌아올 때 이 함수로 맞춘다.
+    fn apply_sort(&mut self) {
+        let name = self.selected_name();
+        let mode = self.sort;
+        let children = &mut self.current_node_mut().children;
+        match mode {
+            SortMode::SizeDesc => children.sort_by(|a, b| b.size.cmp(&a.size)),
+            SortMode::SizeAsc => children.sort_by(|a, b| a.size.cmp(&b.size)),
+            SortMode::Name => children.sort_by_cached_key(|c| c.name.to_lowercase()),
+        }
+        if let Some(name) = name {
+            let i = self.children().iter().position(|c| *c.name == *name);
+            self.state.select(i.or(Some(0)).filter(|_| !self.children().is_empty()));
+        }
     }
 
     pub fn children(&self) -> &[Node] {
@@ -406,6 +469,11 @@ impl App {
         self.stack.push(i);
         self.current.push(name);
         self.state.select(has_children.then_some(0));
+        self.apply_sort();
+        // 정렬 순서가 크기순이 아니면 맨 위 항목이 달라졌을 수 있다
+        if has_children {
+            self.state.select(Some(0));
+        }
         self.status = None;
         self.show_errors = false;
     }
@@ -416,6 +484,8 @@ impl App {
         if let Some(i) = self.stack.pop() {
             self.current.pop();
             self.state.select(Some(i));
+            // 안에 있는 동안 정렬 순서를 바꿨을 수 있으므로 돌아온 폴더도 맞춘다
+            self.apply_sort();
             self.status = None;
             self.show_errors = false;
             return;
@@ -945,6 +1015,7 @@ impl App {
             }
         }
 
+        self.apply_sort();
         self.last_scan = Some(done.elapsed);
         self.last_checked = Some(Instant::now());
         self.scan_durations.push((done.stamp, done.elapsed));
@@ -1446,6 +1517,58 @@ mod tests {
             q.pop();
         });
         assert_eq!(app.state.selected(), Some(4), "Delta");
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn sorting_reorders_only_the_view_and_follows_the_highlight_through_navigation() {
+        let root = temp_root("sort");
+        // 크기: zeta(4) > Mid(3) > alpha(2) > beta(1). 안쪽 폴더 zeta 안에는 y(1) < x(5)
+        for (name, kb) in [("zeta", 40), ("Mid", 30), ("alpha", 20), ("beta", 10)] {
+            fs::create_dir_all(root.join(name)).unwrap();
+            fs::write(root.join(name).join("f"), vec![1u8; kb * 1000]).unwrap();
+        }
+        fs::write(root.join("zeta/y"), vec![1u8; 100]).unwrap();
+        fs::write(root.join("zeta/x"), vec![1u8; 200_000]).unwrap();
+        let mut app = App::new(root.clone());
+        wait(&mut app);
+        assert_eq!(app.sort, SortMode::SizeDesc);
+        assert_eq!(names(&app), ["zeta", "Mid", "alpha", "beta"]);
+
+        // 하이라이트한 항목(Mid)은 순서가 바뀌어도 그대로 따라간다
+        app.state.select(Some(1));
+        app.cycle_sort();
+        assert_eq!(app.sort, SortMode::Name);
+        assert_eq!(names(&app), ["alpha", "beta", "Mid", "zeta"], "case-insensitive by name");
+        assert_eq!(app.selected_name().as_deref(), Some("Mid"));
+        app.cycle_sort();
+        assert_eq!(names(&app), ["beta", "alpha", "Mid", "zeta"]);
+        assert_eq!(app.selected_name().as_deref(), Some("Mid"));
+
+        // 안으로 들어가도 같은 순서를 쓰고, 맨 위 항목이 선택된다
+        let zeta = names(&app).iter().position(|n| n == "zeta").unwrap();
+        app.state.select(Some(zeta));
+        app.enter();
+        assert_eq!(app.sort, SortMode::SizeAsc);
+        let inner: Vec<_> = names(&app);
+        let sizes: Vec<u64> = app.children().iter().map(|c| c.size).collect();
+        assert!(sizes.windows(2).all(|w| w[0] <= w[1]), "{inner:?} {sizes:?}");
+        assert_eq!(app.state.selected(), Some(0));
+
+        // 안에서 순서를 바꾼 뒤 돌아오면 위쪽도 새 순서이고, 나온 폴더(zeta)에 하이라이트가 있다
+        app.cycle_sort(); // 크기 큰 순
+        app.cycle_sort(); // 이름순
+        assert_eq!(app.sort, SortMode::Name);
+        app.back();
+        assert_eq!(names(&app), ["alpha", "beta", "Mid", "zeta"]);
+        assert_eq!(app.selected_name().as_deref(), Some("zeta"));
+
+        // 다시 읽어도 현재 정렬 순서를 지킨다
+        app.rescan();
+        wait(&mut app);
+        assert_eq!(names(&app), ["alpha", "beta", "Mid", "zeta"]);
+        assert_eq!(app.selected_name().as_deref(), Some("zeta"));
 
         fs::remove_dir_all(&root).unwrap();
     }

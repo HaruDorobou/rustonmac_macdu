@@ -8,7 +8,7 @@ use ratatui::{
     Frame,
 };
 
-use crate::app::{App, Change};
+use crate::app::{App, Change, SortMode};
 use crate::units::Units;
 
 const BAR_WIDTH: usize = 20;
@@ -62,6 +62,7 @@ const HELP_TEXT: &[(&str, &str)] = &[
     ("w  + -", "감시 켜기/끄기, 간격 조절"),
     ("e", "읽지 못한 경로 목록"),
     ("보기", ""),
+    ("S", "정렬 순환: 크기 큰 순 / 이름순 / 크기 작은 순"),
     ("u", "단위 순환: 자동 K M G T"),
     ("s", "기준 전환: 1024 / 1000"),
     ("i", "정확한 바이트 수"),
@@ -350,8 +351,13 @@ fn draw_list(f: &mut Frame, app: &mut App, area: Rect) {
         })
         .collect();
 
+    // 기본 순서가 아니면 테두리에 알려 준다
+    let mut block = Block::default().borders(Borders::ALL);
+    if app.sort != SortMode::default() {
+        block = block.title(format!(" 정렬: {} ", app.sort.label()));
+    }
     let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL))
+        .block(block)
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
         .highlight_symbol("> ");
     app.page_rows = area.height.saturating_sub(2) as usize;
