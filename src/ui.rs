@@ -78,7 +78,8 @@ const HELP_TEXT: &[(&str, &str)] = &[
     ("?", "이 도움말 열기/닫기"),
     ("q  Esc", "종료 (팝업이 열려 있으면 닫기)"),
     ("Ctrl-c", "어디서든 바로 종료"),
-    ("한글 자판", "단축키는 영문 기준. 소문자 키만 영문으로 처리, G S Y N은 영문으로"),
+    ("한글 자판", "단축키는 영문 기준입니다"),
+    ("", "한글 상태에서는 소문자 키만 처리: G S Y N은 영문으로"),
 ];
 
 /// 찾기 화면: 지금 보는 폴더 아래에서 이름이 일치하는 항목, 또는 가장 큰 항목
@@ -214,9 +215,12 @@ fn draw_warning(f: &mut Frame, msg: &str) {
     f.render_widget(body, area);
 }
 
+/// 도움말 팝업 폭. 가장 긴 줄이 잘리지 않을 만큼 넓어야 한다 (테스트가 확인한다).
+const HELP_WIDTH: u16 = 78;
+
 fn draw_help(f: &mut Frame) {
     let screen = f.area();
-    let width = 62.min(screen.width);
+    let width = HELP_WIDTH.min(screen.width);
     let height = (HELP_TEXT.len() as u16 + 2).min(screen.height);
     let area = Rect {
         x: screen.x + (screen.width - width) / 2,
@@ -853,6 +857,18 @@ mod tests {
         let without: String = t.backend().buffer().content().iter().map(|c| c.symbol()).collect();
         assert_eq!(with, without.matches('[').count() + 1, "the label adds one bracket pair");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn every_help_line_fits_the_popup_width() {
+        // 테두리 2칸 + 앞 공백 3칸 + 키 열 18칸을 뺀 나머지가 설명이 쓸 수 있는 폭이다
+        let room = HELP_WIDTH as usize - 2 - 3 - 18;
+        for (key, what) in HELP_TEXT {
+            let key_w = Span::raw(key.to_string()).width();
+            assert!(key_w <= 18, "{key:?} is wider than the key column");
+            let w = Span::raw(what.to_string()).width();
+            assert!(w <= room, "{key:?}: {what:?} is {w} columns, only {room} fit");
+        }
     }
 
     #[test]
