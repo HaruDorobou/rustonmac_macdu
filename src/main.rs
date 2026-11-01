@@ -53,6 +53,7 @@ fn main() -> io::Result<()> {
     }
     if let Some(secs) = opts.watch {
         app.enable_watch(secs);
+        app.warn_if_wide_watch();
     }
 
     enable_raw_mode()?;

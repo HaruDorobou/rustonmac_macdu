@@ -328,7 +328,8 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     let footer = if let Some(msg) = &app.status {
         Paragraph::new(format!(" ⚠ {}", msg)).style(Style::default().fg(Color::Red))
     } else if let Some(msg) = app.notice() {
-        Paragraph::new(format!(" {}", msg)).style(Style::default().fg(Color::Green))
+        let color = if msg.starts_with('⚠') { Color::Yellow } else { Color::Green };
+        Paragraph::new(format!(" {}", msg)).style(Style::default().fg(color))
     } else {
         let items = help_items(app.watch.is_some(), app.unreadable_here() > 0);
         Paragraph::new(help_line(&items, area.width as usize))
