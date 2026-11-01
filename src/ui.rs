@@ -9,6 +9,7 @@ use ratatui::{
 };
 
 use crate::app::{App, Change, SortMode};
+use crate::inputsource::Source;
 use crate::units::Units;
 
 const BAR_WIDTH: usize = 20;
@@ -76,6 +77,7 @@ const HELP_TEXT: &[(&str, &str)] = &[
     ("기타", ""),
     ("?", "이 도움말 열기/닫기"),
     ("q  Esc", "종료 (팝업에서는 닫기)"),
+    ("한글 자판", "단축키는 영문 기준. 소문자 키만 영문으로 처리, G S Y N은 영문으로"),
 ];
 
 /// 찾기 화면: 지금 보는 폴더 아래에서 이름이 일치하는 항목, 또는 가장 큰 항목
@@ -133,7 +135,7 @@ fn draw_find(f: &mut Frame, app: &mut App) {
         } else {
             " j/k 이동 · Enter 그 위치로 · / 이름 입력 · Tab 종류 · Esc 닫기 "
         });
-    if let Some(label) = input_mode_label(app.hangul) {
+    if let Some(label) = input_mode_label(app.input_source) {
         block = block.title(Line::from(label).right_aligned());
     }
     let inner = block.inner(area);
@@ -284,30 +286,16 @@ fn draw_expand(f: &mut Frame, app: &mut App) {
     f.render_stateful_widget(list, area, &mut app.expand_state);
 }
 
-/// 글자를 입력하는 칸에 붙이는 입력 상태 표시. 아직 알 수 없으면 `None`.
-fn input_mode_label(hangul: Option<bool>) -> Option<Span<'static>> {
-    hangul.map(|h| {
-        if h {
-            Span::styled(" [한글] ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
-        } else {
-            Span::styled(" [영문] ", Style::default().fg(Color::DarkGray))
+/// 글자를 입력하는 칸에 붙이는 입력 상태 표시. 읽을 수 없으면 `None`.
+fn input_mode_label(source: Option<Source>) -> Option<Span<'static>> {
+    source.map(|s| {
+        let text = format!(" [{}] ", s.label());
+        match s {
+            Source::Korean => Span::styled(text, Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Source::English => Span::styled(text, Style::default().fg(Color::DarkGray)),
+            Source::Other => Span::styled(text, Style::default().fg(Color::Magenta)),
         }
     })
-}
-
-/// 헤더 제목. 한글 자판으로 키를 눌렀다면 그 사실과 한계를 알려 준다.
-fn header_title(hangul: bool) -> Line<'static> {
-    if hangul {
-        Line::from(vec![
-            Span::raw(" mac-du "),
-            Span::styled(
-                "[한글 자판 → 영문 키로 처리 · G S Y 같은 대문자 키는 영문으로 바꿔야 함] ",
-                Style::default().fg(Color::Yellow),
-            ),
-        ])
-    } else {
-        Line::from(" mac-du ")
-    }
 }
 
 fn draw_header(f: &mut Frame, app: &App, area: Rect) {
@@ -414,7 +402,7 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
         Block::default()
             .borders(Borders::ALL)
             .border_style(border)
-            .title(header_title(app.hangul == Some(true))),
+            .title(" mac-du "),
     );
     f.render_widget(header, area);
 }
@@ -503,7 +491,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         let color = if app.search_has_match() { Color::Yellow } else { Color::Red };
         let note = if app.search_has_match() { "" } else { "  (일치 없음)" };
         let mut spans = vec![Span::raw(format!(" /{q}█{note}  Enter 확정 · Esc 취소"))];
-        spans.extend(input_mode_label(app.hangul));
+        spans.extend(input_mode_label(app.input_source));
         Paragraph::new(Line::from(spans)).style(Style::default().fg(color))
     } else if let Some(msg) = &app.status {
         Paragraph::new(format!(" ⚠ {}", msg)).style(Style::default().fg(Color::Red))
@@ -831,10 +819,11 @@ mod tests {
     }
 
     #[test]
-    fn the_input_mode_label_appears_only_once_it_is_known() {
-        assert!(input_mode_label(None).is_none(), "nothing is claimed before a letter key is pressed");
-        assert!(input_mode_label(Some(true)).unwrap().content.contains("한글"));
-        assert!(input_mode_label(Some(false)).unwrap().content.contains("영문"));
+    fn the_input_mode_label_appears_only_when_the_source_is_known() {
+        assert!(input_mode_label(None).is_none(), "nothing is claimed when the source cannot be read");
+        assert!(input_mode_label(Some(Source::Korean)).unwrap().content.contains("한글"));
+        assert!(input_mode_label(Some(Source::English)).unwrap().content.contains("영문"));
+        assert!(input_mode_label(Some(Source::Other)).unwrap().content.contains("기타"));
 
         // 찾기 화면에서 글자를 입력하는 중에도 그려진다
         use ratatui::{backend::TestBackend, Terminal};
@@ -852,13 +841,13 @@ mod tests {
         }
         app.open_find();
         app.find_set_typing(true);
-        app.hangul = Some(false);
+        app.input_source = Some(Source::English);
         let mut t = Terminal::new(TestBackend::new(100, 30)).unwrap();
         t.draw(|f| draw(f, &mut app)).unwrap();
         let drawn: String = t.backend().buffer().content().iter().map(|c| c.symbol()).collect();
         // 한글은 칸이 나뉘어 이어지지 않으므로, 라벨의 대괄호 개수 차이로 확인한다
         let with = drawn.matches('[').count();
-        app.hangul = None;
+        app.input_source = None;
         t.draw(|f| draw(f, &mut app)).unwrap();
         let without: String = t.backend().buffer().content().iter().map(|c| c.symbol()).collect();
         assert_eq!(with, without.matches('[').count() + 1, "the label adds one bracket pair");

@@ -4,6 +4,7 @@ mod clipboard;
 mod find;
 mod finder;
 mod hangul;
+mod inputsource;
 mod units;
 mod scanner;
 mod ui;
@@ -262,6 +263,8 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> io::
     let mut pending_g = false;
     while !app.should_quit {
         app.poll_scan();
+        // 입력 소스는 키를 누르지 않아도 바뀌므로 매 프레임 확인한다 (화면에 표시만 한다)
+        app.input_source = inputsource::current();
         terminal.draw(|f| ui::draw(f, app))?;
 
         // 입력이 없어도 80ms마다 다시 그려 스캔 결과와 스피너를 반영한다
@@ -270,23 +273,16 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> io::
                 if key.kind != KeyEventKind::Press {
                     continue;
                 }
-                // 한글/영문 어느 쪽으로 치고 있는지는 어떤 칸에서든 화면에 알려 준다
                 let plain_char = match key.code {
                     KeyCode::Char(c) if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => Some(c),
                     _ => None,
                 };
-                if let Some(c) = plain_char {
-                    if hangul::is_hangul(c) {
-                        app.hangul = Some(true);
-                    } else if c.is_ascii_alphabetic() {
-                        app.hangul = Some(false);
-                    }
-                }
                 // 글자를 입력하는 칸이 아닐 때만, 한글 자판으로 눌린 키를 영문 키로 되돌린다
                 let typing = app.search_input.is_some() || app.find.as_ref().is_some_and(|v| v.typing);
                 let mut keys = vec![key];
                 if let (false, Some(c)) = (typing, plain_char) {
                     if let Some(mapped) = hangul::to_keys(c) {
+                        app.hint_korean_keyboard();
                         keys = mapped
                             .into_iter()
                             .map(|a| {
@@ -360,7 +356,6 @@ mod tests {
         let mut keys = vec![plain(c)];
         if !typing {
             if let Some(mapped) = hangul::to_keys(c) {
-                app.hangul = Some(true);
                 keys = mapped.into_iter().map(plain).collect();
             }
         }
@@ -393,7 +388,6 @@ mod tests {
         assert_eq!(app.state.selected(), before.map(|i| i + 1));
         press(&mut app, &mut g, 'ㅏ');
         assert_eq!(app.state.selected(), before);
-        assert_eq!(app.hangul, Some(true), "the header is told a Korean keyboard is in use");
 
         // ㅎㅎ = gg
         press(&mut app, &mut g, 'ㅓ');

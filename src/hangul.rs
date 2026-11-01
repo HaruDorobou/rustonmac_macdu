@@ -56,11 +56,6 @@ pub fn to_keys(c: char) -> Option<Vec<char>> {
     Some(out)
 }
 
-/// 한글 자모나 완성된 글자인가
-pub fn is_hangul(c: char) -> bool {
-    to_keys(c).is_some()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

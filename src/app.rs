@@ -219,9 +219,10 @@ pub struct App {
     search_origin: Option<usize>,
     /// 마지막으로 확정한 검색어. `n`/`N`이 이것을 다시 찾는다.
     last_query: String,
-    /// 마지막으로 누른 글자 키가 한글(`Some(true)`)인지 영문(`Some(false)`)인지.
-    /// 글자 키를 아직 누르지 않아 알 수 없으면 `None`. 화면에 입력 상태를 알려 주는 용도다.
-    pub hangul: Option<bool>,
+    /// 지금 선택된 키보드 입력 소스. 읽을 수 없으면 `None`. 입력 칸에 표시하는 용도다.
+    pub input_source: Option<crate::inputsource::Source>,
+    /// 한글 자판 안내를 이미 보여 줬는가 (세션에 한 번만)
+    korean_hint_shown: bool,
     /// 경고 팝업의 내용. 있으면 팝업이 열려 있고, 확인할 때까지 다른 키를 받지 않는다.
     pub warning: Option<String>,
     /// 키 도움말 팝업이 열려 있는지
@@ -289,7 +290,8 @@ impl App {
             show_errors: false,
             error_state: ListState::default(),
             show_help: false,
-            hangul: None,
+            input_source: None,
+            korean_hint_shown: false,
             warning: None,
             find: None,
             sort: SortMode::default(),
@@ -748,6 +750,18 @@ impl App {
         if let Some(w) = &mut self.watch {
             w.next_at = Instant::now() + effective;
         }
+    }
+
+    /// 한글 자판으로 단축키를 처음 눌렀을 때 한 번만, 단축키가 영문 기준이라는 것을 알려 준다.
+    pub fn hint_korean_keyboard(&mut self) {
+        if self.korean_hint_shown {
+            return;
+        }
+        self.korean_hint_shown = true;
+        self.notice = Some((
+            "단축키는 영문 자판 기준입니다. 한글 상태에서는 소문자 키만 처리하니, G S Y N은 영문으로 바꿔 주세요".into(),
+            Instant::now(),
+        ));
     }
 
     /// 방금 갱신에서 `name` 항목의 크기가 달라졌다면 그 변화 (일정 시간 동안만)
