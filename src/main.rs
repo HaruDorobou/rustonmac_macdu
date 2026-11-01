@@ -136,6 +136,27 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> io::
                     }
                     continue;
                 }
+                // 검색어를 입력하는 중에는 글자 키를 모두 검색어로 받는다
+                if app.search_input.is_some() {
+                    match key.code {
+                        KeyCode::Enter => app.search_confirm(),
+                        KeyCode::Esc => app.search_cancel(),
+                        KeyCode::Backspace => {
+                            if app.search_input.as_deref() == Some("") {
+                                app.search_cancel();
+                            } else {
+                                app.search_edit(|q| {
+                                    q.pop();
+                                });
+                            }
+                        }
+                        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            app.search_edit(|q| q.push(c));
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
                 // 도움말 팝업이 열려 있으면 닫는 키만 받는다
                 if app.show_help {
                     if matches!(
@@ -184,6 +205,9 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> io::
                 }
                 match key.code {
                     KeyCode::Char('?') => app.show_help = true,
+                    KeyCode::Char('/') => app.start_search(),
+                    KeyCode::Char('n') => app.search_next(true),
+                    KeyCode::Char('N') => app.search_next(false),
                     KeyCode::Char('p') => app.open_expand(),
                     KeyCode::Char('y') => app.copy_selected(),
                     KeyCode::Char('Y') => app.copy_current(),

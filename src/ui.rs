@@ -53,6 +53,7 @@ const HELP_TEXT: &[(&str, &str)] = &[
     ("G  End", "맨 아래 항목"),
     ("Ctrl-d  Ctrl-u", "반 화면 아래/위"),
     ("PageDown  PageUp", "한 화면 아래/위"),
+    ("/  n  N", "이름 검색, 다음/이전 일치 항목"),
     ("l  Enter  →", "폴더 안으로"),
     ("h  Backspace  ←", "상위 폴더로"),
     ("스캔", ""),
@@ -359,7 +360,12 @@ fn draw_list(f: &mut Frame, app: &mut App, area: Rect) {
 
 fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     // 푸터: 오류 메시지 > 잠깐 보여 주는 알림 > 키 도움말 순서로 보여 준다
-    let footer = if let Some(msg) = &app.status {
+    let footer = if let Some(q) = &app.search_input {
+        // 검색어 입력 중: 일치가 없으면 빨갛게
+        let color = if app.search_has_match() { Color::Yellow } else { Color::Red };
+        let note = if app.search_has_match() { "" } else { "  (일치 없음)" };
+        Paragraph::new(format!(" /{q}█{note}  Enter 확정 · Esc 취소")).style(Style::default().fg(color))
+    } else if let Some(msg) = &app.status {
         Paragraph::new(format!(" ⚠ {}", msg)).style(Style::default().fg(Color::Red))
     } else if let Some(msg) = app.notice() {
         Paragraph::new(format!(" {}", msg)).style(Style::default().fg(Color::Green))
@@ -380,6 +386,7 @@ fn help_items(watching: bool, has_errors: bool) -> Vec<(u8, String)> {
         (1, "h 상위".to_string()),
         (2, "? 도움말".to_string()),
         (3, "r 갱신".to_string()),
+        (5, "/ 검색".to_string()),
         (6, "p 위쪽".to_string()),
         (5, "w 감시".to_string()),
     ];

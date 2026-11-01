@@ -163,6 +163,12 @@ pub struct App {
     /// 오류 목록 팝업이 열려 있는지
     pub show_errors: bool,
     pub error_state: ListState,
+    /// 검색어를 입력하는 중이면 지금까지 친 글자
+    pub search_input: Option<String>,
+    /// 검색을 시작하기 전에 선택돼 있던 위치. `Esc`로 취소하면 여기로 돌아간다.
+    search_origin: Option<usize>,
+    /// 마지막으로 확정한 검색어. `n`/`N`이 이것을 다시 찾는다.
+    last_query: String,
     /// 경고 팝업의 내용. 있으면 팝업이 열려 있고, 확인할 때까지 다른 키를 받지 않는다.
     pub warning: Option<String>,
     /// 키 도움말 팝업이 열려 있는지
@@ -231,6 +237,9 @@ impl App {
             error_state: ListState::default(),
             show_help: false,
             warning: None,
+            search_input: None,
+            search_origin: None,
+            last_query: String::new(),
             page_rows: 10,
             watch: None,
             last_watch_secs: DEFAULT_WATCH_SECS,
@@ -292,6 +301,86 @@ impl App {
     pub fn jump(&mut self, jump: Jump) {
         let i = jumped(self.state.selected(), self.children().len(), jump);
         self.state.select(i);
+    }
+
+    // ---- 검색 -------------------------------------------------------------
+
+    /// 현재 폴더 목록에서 `query`가 이름에 들어 있는(대소문자 무시) 항목의 위치.
+    /// `start`에서 `forward` 방향으로 훑고, 끝에 닿으면 반대쪽 끝에서 이어간다.
+    /// `include_start`가 `false`면 `start` 자신은 마지막에 본다.
+    fn find_match(&self, query: &str, start: usize, forward: bool, include_start: bool) -> Option<usize> {
+        let len = self.children().len();
+        if len == 0 || query.is_empty() {
+            return None;
+        }
+        let q = query.to_lowercase();
+        let first = usize::from(!include_start);
+        (first..first + len).find_map(|off| {
+            let i = if forward { (start + off) % len } else { (start + len - off % len) % len };
+            self.children()[i].name.to_lowercase().contains(&q).then_some(i)
+        })
+    }
+
+    /// `/`: 검색어 입력을 시작한다.
+    pub fn start_search(&mut self) {
+        if self.children().is_empty() {
+            return;
+        }
+        self.search_origin = self.state.selected();
+        self.search_input = Some(String::new());
+        self.status = None;
+    }
+
+    /// 입력 중인 검색어를 고치고, 지금 위치부터 처음 일치하는 항목으로 하이라이트를 옮긴다.
+    pub fn search_edit(&mut self, f: impl FnOnce(&mut String)) {
+        let Some(mut q) = self.search_input.take() else { return };
+        f(&mut q);
+        let origin = self.search_origin.unwrap_or(0);
+        match self.find_match(&q, origin, true, true) {
+            Some(i) => self.state.select(Some(i)),
+            None => self.state.select(self.search_origin),
+        }
+        self.search_input = Some(q);
+    }
+
+    /// 입력 중인 검색어에 일치하는 항목이 있는가 (비어 있으면 `true`)
+    pub fn search_has_match(&self) -> bool {
+        let Some(q) = &self.search_input else { return true };
+        let origin = self.search_origin.unwrap_or(0);
+        q.is_empty() || self.find_match(q, origin, true, true).is_some()
+    }
+
+    /// `Enter`: 지금 하이라이트된 위치에서 검색을 끝내고 검색어를 기억해 둔다.
+    pub fn search_confirm(&mut self) {
+        let Some(q) = self.search_input.take() else { return };
+        if q.is_empty() {
+            return;
+        }
+        if self.find_match(&q, self.search_origin.unwrap_or(0), true, true).is_none() {
+            self.state.select(self.search_origin);
+            self.status = Some(format!("일치하는 항목이 없습니다: {q}"));
+        }
+        self.last_query = q;
+    }
+
+    /// `Esc`: 검색을 취소하고 시작하기 전 위치로 돌아간다.
+    pub fn search_cancel(&mut self) {
+        if self.search_input.take().is_some() {
+            self.state.select(self.search_origin);
+        }
+    }
+
+    /// `n` / `N`: 마지막 검색어와 일치하는 다음 / 이전 항목으로 간다.
+    pub fn search_next(&mut self, forward: bool) {
+        if self.last_query.is_empty() {
+            self.status = Some("검색어가 없습니다. / 로 먼저 검색하세요".into());
+            return;
+        }
+        let cur = self.state.selected().unwrap_or(0);
+        match self.find_match(&self.last_query, cur, forward, false) {
+            Some(i) => self.state.select(Some(i)),
+            None => self.status = Some(format!("일치하는 항목이 없습니다: {}", self.last_query)),
+        }
     }
 
     /// 선택한 항목이 폴더면 그 안으로 들어간다. 이미 스캔해 둔 트리에서 바로 보여 주므로
@@ -1290,6 +1379,73 @@ mod tests {
         app.current = PathBuf::from("/");
         app.adjust_watch(true);
         assert_eq!(app.warning, None);
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn search_moves_the_highlight_confirms_cancels_and_repeats() {
+        let root = temp_root("search");
+        // 크기 순서: big_Alpha(6) > beta(5) > alpha_two(4) > gamma(3) > Delta(2) > alpha_three(1)
+        for (i, name) in ["big_Alpha", "beta", "alpha_two", "gamma", "Delta", "alpha_three"].iter().enumerate() {
+            fs::create_dir_all(root.join(name)).unwrap();
+            fs::write(root.join(name).join("f"), vec![1u8; 100_000 * (6 - i)]).unwrap();
+        }
+        let mut app = App::new(root.clone());
+        wait(&mut app);
+        assert_eq!(names(&app), ["big_Alpha", "beta", "alpha_two", "gamma", "Delta", "alpha_three"]);
+
+        // 치는 동안 따라간다 (대소문자 무시, 이름 일부)
+        app.state.select(Some(1)); // beta
+        app.start_search();
+        app.search_edit(|q| q.push_str("alp"));
+        assert_eq!(app.state.selected(), Some(2), "first match at or after where we were");
+        assert!(app.search_has_match());
+        app.search_edit(|q| q.push_str("ha_t"));
+        assert_eq!(app.state.selected(), Some(2));
+        app.search_edit(|q| q.push_str("hree"));
+        assert_eq!(app.state.selected(), Some(5));
+
+        // Esc는 시작 위치로 돌려놓고 검색어를 기억하지 않는다
+        app.search_cancel();
+        assert_eq!(app.state.selected(), Some(1));
+        assert!(app.search_input.is_none());
+        app.search_next(true);
+        assert!(app.status.is_some(), "nothing to repeat yet");
+
+        // Enter는 그 자리에서 확정하고, n / N은 끝에서 처음으로 이어서 돌아본다
+        app.state.select(Some(1));
+        app.start_search();
+        app.search_edit(|q| q.push_str("alpha"));
+        app.search_confirm();
+        assert_eq!(app.state.selected(), Some(2), "first match at or after where we started");
+        app.search_next(true);
+        assert_eq!(app.state.selected(), Some(5));
+        app.search_next(true);
+        assert_eq!(app.state.selected(), Some(0), "wraps past the end; big_Alpha matches case-insensitively");
+        app.search_next(false);
+        assert_eq!(app.state.selected(), Some(5), "N goes backwards, wrapping past the top");
+        app.search_next(false);
+        assert_eq!(app.state.selected(), Some(2));
+
+        // 일치가 없으면 하이라이트는 움직이지 않고, 확정하면 알려 준다
+        app.state.select(Some(3));
+        app.start_search();
+        app.search_edit(|q| q.push_str("zzz"));
+        assert!(!app.search_has_match());
+        assert_eq!(app.state.selected(), Some(3));
+        app.search_confirm();
+        assert_eq!(app.state.selected(), Some(3));
+        assert!(app.status.as_deref().is_some_and(|m| m.contains("zzz")));
+
+        // 한 글자씩 지우면 다시 처음 위치부터 찾는다
+        app.state.select(Some(3));
+        app.start_search();
+        app.search_edit(|q| q.push_str("dx"));
+        app.search_edit(|q| {
+            q.pop();
+        });
+        assert_eq!(app.state.selected(), Some(4), "Delta");
 
         fs::remove_dir_all(&root).unwrap();
     }
